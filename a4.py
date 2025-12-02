@@ -573,7 +573,7 @@ class CommandInterface:
         if my_groups:
             bonus += 0.5 * self._merge_gain_from_groups(my_groups, group_sizes)
         if opp_groups:
-            bonus += 0.8 * self._merge_gain_from_groups(opp_groups, group_sizes)
+            bonus += 0.4 * self._merge_gain_from_groups(opp_groups, group_sizes)
         return bonus
 
     # --- Evaluation ---
