@@ -492,7 +492,7 @@ class CommandInterface:
             k1, k2 = self.killer_moves[depth]
         
         # Only build groups at shallow depths (cheap and effective for ordering)
-        use_merge = depth == 0
+        use_merge = depth <= 1
         group_map = group_sizes = group_owner = None
         if use_merge:
             group_map, group_sizes, group_owner = self._build_groups()
@@ -573,7 +573,7 @@ class CommandInterface:
         if my_groups:
             bonus += 0.5 * self._merge_gain_from_groups(my_groups, group_sizes)
         if opp_groups:
-            bonus += 0.6 * self._merge_gain_from_groups(opp_groups, group_sizes)
+            bonus += 0.8 * self._merge_gain_from_groups(opp_groups, group_sizes)
         return bonus
 
     # --- Evaluation ---
