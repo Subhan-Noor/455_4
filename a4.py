@@ -26,14 +26,9 @@ class CommandInterface:
         self.handicap = 0.0
         self.score_cutoff = float("inf")
         self.time_limit = 1
-        # Internal flag used by the search to stop when time is up
         self._time_up = False
-        # Move count for O(1) empty counting
         self.move_count = 0
-        # Principal variation move from previous iteration
         self._pv_move = None
-        # Transposition table: board_hash -> (depth, value, flag)
-        # flag: 'exact', 'lower', 'upper'
         self._tt = {}
 
     # Convert a raw string to a command and a list of arguments
@@ -132,7 +127,7 @@ class CommandInterface:
         self.p2_score = self.handicap
         self.move_count = 0
         self._pv_move = None
-        self._tt = {}  # Clear transposition table for new game
+        self._tt = {}
         return True
 
     def show(self, args):
@@ -176,29 +171,17 @@ class CommandInterface:
         p1_score, p2_score = self.calculate_score()
         print(p1_score, p2_score)
         return True
-    
-    # -----------------------------
-    # Search helpers for genmove()
-    # -----------------------------
 
     def _board_full(self):
-        """Return True if there are no empty points left."""
         return self.move_count >= self.width * self.height
 
     def _get_empties(self):
-        """Return count of empty squares."""
         return self.width * self.height - self.move_count
 
     def _board_hash(self):
-        """Simple hash for transposition table."""
-        # Include to_play in hash to distinguish positions
         return (tuple(tuple(row) for row in self.board), self.to_play)
 
     def _evaluate(self):
-        """
-        Heuristic evaluation: score difference from the perspective
-        of the current player (self.to_play).
-        """
         p1_score, p2_score = self.calculate_score()
         if self.to_play == 1:
             return p1_score - p2_score
@@ -206,19 +189,11 @@ class CommandInterface:
             return p2_score - p1_score
 
     def _move_order_key(self, move):
-        """
-        Move ordering heuristic:
-        - Prefer moves near the center
-        - Prefer moves adjacent to existing stones
-        """
         x, y = move
-
-        # Center preference (negative squared distance from center)
         cx = (self.width - 1) / 2.0
         cy = (self.height - 1) / 2.0
         center_score = -((x - cx) ** 2 + (y - cy) ** 2)
 
-        # Adjacency score: count neighboring stones (8 directions)
         adj = 0
         for dy in (-1, 0, 1):
             for dx in (-1, 0, 1):
@@ -229,47 +204,27 @@ class CommandInterface:
                     if self.board[ny][nx] != 0:
                         adj += 1
 
-        # Adjacency dominates, center breaks ties
         return adj * 10.0 + center_score
 
     def _negamax(self, depth, alpha, beta, deadline):
-        """
-        Standard negamax with alpha-beta pruning.
-        Values are always from the perspective of the player to move
-        (self.to_play) at this node.
-        
-        Includes:
-        - Late-game handling: caps depth by empties in endgame (but respects depth limit)
-        - Transposition table for caching
-        """
-        # Time check
         if time.perf_counter() >= deadline:
             self._time_up = True
             return self._evaluate()
 
-        # Terminal: board full
         if self._board_full():
             return self._evaluate()
 
         empties = self._get_empties()
-        
-        # Late-game handling: when few empties remain, we can search deeper
-        # But we must respect the depth limit from iterative deepening
         ENDGAME_THRESHOLD = 12
         
-        # Normal depth cut: if depth is 0, evaluate
         if depth == 0:
             return self._evaluate()
         
-        # In endgame: cap depth by empties, but never exceed what iterative deepening asked for
         if empties <= ENDGAME_THRESHOLD:
-            # Don't search deeper than empties (no point), but respect depth limit
             effective_depth = min(depth, empties)
         else:
-            # Normal search: use requested depth
             effective_depth = depth
 
-        # Transposition table lookup
         alpha_orig = alpha
         board_key = self._board_hash()
         if board_key in self._tt:
@@ -286,10 +241,8 @@ class CommandInterface:
 
         moves = self.get_moves()
         if not moves:
-            # Safety: no legal moves, treat as leaf
             return self._evaluate()
 
-        # Move ordering to improve alpha-beta pruning
         moves.sort(key=self._move_order_key, reverse=True)
 
         best = -float("inf")
@@ -300,8 +253,6 @@ class CommandInterface:
             self.undo_move(x, y)
 
             if self._time_up:
-                # Time is up: return the best value found so far (if any),
-                # or a safe fallback of 0.
                 return best if best != -float("inf") else 0.0
 
             if val > best:
@@ -309,10 +260,8 @@ class CommandInterface:
             if val > alpha:
                 alpha = val
             if alpha >= beta:
-                # Beta cutoff
                 break
 
-        # Store in transposition table
         if not self._time_up:
             if best <= alpha_orig:
                 tt_flag = 'upper'
@@ -325,10 +274,6 @@ class CommandInterface:
         return best
 
     def _root_search(self, max_depth, deadline):
-        """
-        Root-level search: returns (best_move, best_value) for the given depth.
-        Uses PV move ordering: try best move from previous iteration first.
-        """
         best_move = None
         best_val = -float("inf")
 
@@ -336,10 +281,8 @@ class CommandInterface:
         if not moves:
             return None, 0.0
 
-        # Order moves: PV move first, then by heuristic
         moves.sort(key=self._move_order_key, reverse=True)
         
-        # Put PV move from previous iteration first (if valid)
         if self._pv_move is not None and self._pv_move in moves:
             moves.remove(self._pv_move)
             moves.insert(0, self._pv_move)
@@ -353,7 +296,6 @@ class CommandInterface:
             self.undo_move(x, y)
 
             if self._time_up:
-                # Time ran out during child search, stop and keep what we have
                 break
 
             if val > best_val or best_move is None:
@@ -482,61 +424,38 @@ class CommandInterface:
     # Make sure you print a move within the specified time limit (1 second by default)
     # Print the x and y coordinates of your chosen move, space separated.
     def genmove(self, args):
-        """
-        Generate and play a move using iterative deepening alpha-beta search.
-        Respects self.time_limit (seconds) with a small safety margin.
-        
-        Features:
-        - Iterative deepening for time management
-        - PV move ordering (best move from previous depth searched first)
-        - Late-game full-width search (handled in _negamax)
-        - Transposition table for caching
-        """
         moves = self.get_moves()
         if not moves:
-            # No legal moves (should only happen on full board)
-            # Output something legal-ish just in case
             print("0 0")
             return True
 
         start = time.perf_counter()
-        # Safety: don't use full timelimit, and handle t=0 gracefully
         effective_limit = max(0.001, float(self.time_limit))
         deadline = start + max(0.01, 0.9 * effective_limit)
 
-        # Fallback: if search fails or times out very early, play the first move
-        # Use move ordering heuristic for the fallback
         moves.sort(key=self._move_order_key, reverse=True)
         best_move = moves[0]
         best_val = -float("inf")
 
-        # Reset PV move for this search
         self._pv_move = None
 
         depth = 1
-        # Iterative deepening: increase depth until time runs out
         while True:
             self._time_up = False
             move, val = self._root_search(depth, deadline)
 
-            # If we completed this depth within the time limit and found a move,
-            # update our best answer and go deeper.
             if not self._time_up and move is not None:
                 best_move, best_val = move, val
-                self._pv_move = move  # Save PV move for next iteration
+                self._pv_move = move
                 depth += 1
 
-                # In theory we can't search deeper than number of empty squares
                 if depth > self.width * self.height:
                     break
             else:
-                # Either time ran out or something went wrong at this depth
                 break
 
         x, y = best_move
-        # Play the move on our internal board
         self.make_move(x, y)
-        # Print the coordinates as required: "x y"
         print(x, y)
         return True
 
