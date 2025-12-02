@@ -379,17 +379,18 @@ class CommandInterface:
     def iterative_deepening_search(self, time_budget):
         start = time.perf_counter()
         self.search_deadline = start + time_budget
-        root_moves = self.order_moves(self.get_moves(), None)
+        pv_move = None
+        root_moves = self.order_moves(self.get_moves(), None, 0, pv_move)
         if not root_moves:
             return None
         best_move = root_moves[0]
         depth = 1
         last_depth_time = 0.0
         prev_value = 0.0
-        pv_move = None
         while True:
             depth_start = time.perf_counter()
             try:
+                root_moves = self.order_moves(self.get_moves(), None, 0, pv_move)
                 if depth > 1 and prev_value != 0.0:
                     window = 50.0
                     alpha = prev_value - window
@@ -420,7 +421,8 @@ class CommandInterface:
         if terminal:
             return rel_score, None
         if depth >= max_depth:
-            return self.evaluate_position(), None
+            remaining = max_depth - depth
+            return self.evaluate_position(remaining), None
 
         remaining = max_depth - depth
         entry = self._probe_tt()
@@ -503,8 +505,15 @@ class CommandInterface:
         if depth < len(self.killer_moves):
             k1, k2 = self.killer_moves[depth]
         
+        use_merge = depth <= 1
+        group_map = group_sizes = group_owner = None
+        if use_merge:
+            group_map, group_sizes, group_owner = self._build_groups()
+        
         for move in moves:
             score = self.heuristic_move_score(move) + self.history_table[move]
+            if use_merge and group_map is not None:
+                score += self._static_merge_score(move, group_map, group_sizes, group_owner)
             if pv_move and move == pv_move and not seen_pv:
                 score += 6000
                 seen_pv = True
@@ -572,18 +581,24 @@ class CommandInterface:
         if my_groups:
             bonus += 0.5 * self._merge_gain_from_groups(my_groups, group_sizes)
         if opp_groups:
-            bonus += 0.4 * self._merge_gain_from_groups(opp_groups, group_sizes)
+            bonus += 0.6 * self._merge_gain_from_groups(opp_groups, group_sizes)
         return bonus
 
     # --- Evaluation ---
 
-    def evaluate_position(self):
+    def evaluate_position(self, remaining_depth=0):
         p1_score, p2_score = self.calculate_score()
         base = p1_score - p2_score if self.to_play == 1 else p2_score - p1_score
         potential = self.estimate_potential_score()
         pattern = self.pattern_eval()
         mobility = self._mobility_score()
-        return base + potential + 0.4 * pattern + 0.3 * mobility
+        
+        merge_pot = 0.0
+        if remaining_depth <= 2:
+            group_map, group_sizes, group_owner = self._build_groups()
+            merge_pot = self.calc_merge_potential(group_map, group_sizes, group_owner)
+        
+        return base + 0.5 * potential + 0.6 * pattern + 0.2 * mobility + 0.7 * merge_pot
 
     def calc_merge_potential(self, group_map, group_sizes, group_owner):
         """Evaluate merge opportunities using exact exponential gains."""
@@ -614,7 +629,7 @@ class CommandInterface:
                 if len(opp_groups) >= 1:
                     opp_merge += self._merge_gain_from_groups(opp_groups, group_sizes)
         
-        return my_merge - 0.9 * opp_merge
+        return my_merge - 1.0 * opp_merge
 
     def _merge_gain_from_groups(self, groups, group_sizes):
         merged_size = 1  # include the new stone
