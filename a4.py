@@ -48,6 +48,7 @@ class CommandInterface:
         self.tt_size = 1 << self.tt_bits
         self.transposition_table = [None] * self.tt_size
         self.history_table = defaultdict(int)
+        self.killer_moves = [[None, None] for _ in range(64)]  # 2 killers per depth
         self.time_margin = 0.9
         self.search_deadline = 0.0
 
@@ -162,6 +163,7 @@ class CommandInterface:
 
         self.transposition_table = [None] * self.tt_size
         self.history_table.clear()
+        self.killer_moves = [[None, None] for _ in range(64)]
         self._init_zobrist_table()
         self.init_zobrist_hash()
         return True
@@ -419,7 +421,7 @@ class CommandInterface:
             if f == self.TT_UPPER and val <= alpha:
                 return val, tt_move
 
-        moves = self.order_moves(self.get_moves(), tt_move)
+        moves = self.order_moves(self.get_moves(), tt_move, depth)
         if not moves:
             return rel_score, None
 
@@ -443,6 +445,11 @@ class CommandInterface:
             if alpha >= beta:
                 bonus = remaining * remaining if remaining > 0 else 1
                 self.history_table[move] += bonus
+                # Store killer move
+                if depth < len(self.killer_moves):
+                    if self.killer_moves[depth][0] != move:
+                        self.killer_moves[depth][1] = self.killer_moves[depth][0]
+                        self.killer_moves[depth][0] = move
                 break
 
         if best_move is None:
@@ -472,50 +479,119 @@ class CommandInterface:
         idx = self.current_hash & (self.tt_size - 1)
         self.transposition_table[idx] = (self.current_hash, depth, value, flag, best_move)
 
-    def order_moves(self, moves, tt_move):
+    def order_moves(self, moves, tt_move, depth=0):
         if not moves:
             return []
         ordered = []
         seen_tt = False
+        k1, k2 = None, None
+        if depth < len(self.killer_moves):
+            k1, k2 = self.killer_moves[depth]
+        
         for move in moves:
             score = self.heuristic_move_score(move) + self.history_table[move]
             if tt_move and move == tt_move and not seen_tt:
                 score += 5000
                 seen_tt = True
+            elif move == k1:
+                score += 2000
+            elif move == k2:
+                score += 1500
             ordered.append((score, move))
         ordered.sort(key=lambda item: item[0], reverse=True)
         return [move for _, move in ordered]
 
     def heuristic_move_score(self, move):
         x, y = move
-        cx = self.width // 2
-        cy = self.height // 2
-        center_bonus = (self.width - abs(x - cx)) + (self.height - abs(y - cy))
-        adj = 0
-        player = self.to_play
-        other = 2 if player == 1 else 1
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dx == 0 and dy == 0:
-                    continue
-                nx = x + dx
-                ny = y + dy
-                if 0 <= nx < self.width and 0 <= ny < self.height:
-                    if self.board[ny][nx] == player:
-                        adj += 6
-                    elif self.board[ny][nx] == other:
-                        adj += 3
-        return center_bonus * 2 + adj
+        p = self.to_play
+        opp = 2 if p == 1 else 1
+        
+        # Count orthogonal neighbors (scoring is based on orthogonal lines)
+        my_orth = 0
+        opp_orth = 0
+        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.width and 0 <= ny < self.height:
+                if self.board[ny][nx] == p:
+                    my_orth += 1
+                elif self.board[ny][nx] == opp:
+                    opp_orth += 1
+        
+        # Count diagonal neighbors (less important but still useful)
+        my_diag = 0
+        opp_diag = 0
+        for dx, dy in [(1, 1), (1, -1), (-1, 1), (-1, -1)]:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.width and 0 <= ny < self.height:
+                if self.board[ny][nx] == p:
+                    my_diag += 1
+                elif self.board[ny][nx] == opp:
+                    opp_diag += 1
+        
+        score = 0
+        # Connecting multiple own pieces orthogonally = high priority
+        if my_orth >= 2:
+            score += 150 + my_orth * 30
+        elif my_orth == 1:
+            score += 25
+        
+        # Blocking opponent connections = defensive priority
+        if opp_orth >= 2:
+            score += 120 + opp_orth * 25
+        elif opp_orth == 1:
+            score += 15
+        
+        # Diagonal adjacency (smaller bonus)
+        score += my_diag * 8 + opp_diag * 5
+        
+        # Center preference
+        cx, cy = self.width // 2, self.height // 2
+        dist = abs(x - cx) + abs(y - cy)
+        score += (7 - dist) * 3
+        
+        return score
 
     # --- Evaluation ---
 
     def evaluate_position(self):
         p1_score, p2_score = self.calculate_score()
         base = p1_score - p2_score if self.to_play == 1 else p2_score - p1_score
-        potential = self.estimate_potential_score()
+        
+        merge_val = self.calc_merge_potential()
         pattern = self.pattern_eval()
-        mobility = self._mobility_score()
-        return base + potential + 0.4 * pattern + 0.3 * mobility
+        
+        return base + 0.7 * merge_val + 0.25 * pattern
+
+    def calc_merge_potential(self):
+        """Evaluate merge opportunities for both players."""
+        p = self.to_play
+        opp = 2 if p == 1 else 1
+        my_merge = 0
+        opp_merge = 0
+        
+        for y in range(self.height):
+            for x in range(self.width):
+                if self.board[y][x] != 0:
+                    continue
+                # Count orthogonal neighbors for each player
+                my_adj = 0
+                opp_adj = 0
+                for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < self.width and 0 <= ny < self.height:
+                        cell = self.board[ny][nx]
+                        if cell == p:
+                            my_adj += 1
+                        elif cell == opp:
+                            opp_adj += 1
+                
+                # 2+ neighbors means potential merge
+                if my_adj >= 2:
+                    my_merge += my_adj * 2
+                if opp_adj >= 2:
+                    opp_merge += opp_adj * 2
+        
+        return my_merge - 0.9 * opp_merge
 
     def estimate_potential_score(self):
         p = self.to_play
