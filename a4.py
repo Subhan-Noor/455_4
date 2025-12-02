@@ -583,7 +583,7 @@ class CommandInterface:
         base = p1_score - p2_score if self.to_play == 1 else p2_score - p1_score
         potential = self.estimate_potential_score()
         pattern = self.pattern_eval()
-        return base + 0.6 * potential + 0.8 * pattern
+        return base + potential + 0.4 * pattern
 
     def calc_merge_potential(self, group_map, group_sizes, group_owner):
         """Evaluate merge opportunities using exact exponential gains."""
