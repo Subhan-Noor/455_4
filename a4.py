@@ -239,7 +239,7 @@ class CommandInterface:
         (self.to_play) at this node.
         
         Includes:
-        - Late-game full-width search (ignores depth when few empties remain)
+        - Late-game handling: caps depth by empties in endgame (but respects depth limit)
         - Transposition table for caching
         """
         # Time check
@@ -253,16 +253,20 @@ class CommandInterface:
 
         empties = self._get_empties()
         
-        # Late-game full-width search: when few empties remain, search to terminal
-        # This is where AB excels over MCTS
+        # Late-game handling: when few empties remain, we can search deeper
+        # But we must respect the depth limit from iterative deepening
         ENDGAME_THRESHOLD = 12
+        
+        # Normal depth cut: if depth is 0, evaluate
+        if depth == 0:
+            return self._evaluate()
+        
+        # In endgame: cap depth by empties, but never exceed what iterative deepening asked for
         if empties <= ENDGAME_THRESHOLD:
-            # In endgame: ignore depth limit, search to terminal
-            effective_depth = empties
+            # Don't search deeper than empties (no point), but respect depth limit
+            effective_depth = min(depth, empties)
         else:
-            # Normal search: respect depth limit
-            if depth == 0:
-                return self._evaluate()
+            # Normal search: use requested depth
             effective_depth = depth
 
         # Transposition table lookup
