@@ -487,9 +487,17 @@ class CommandInterface:
         k1, k2 = None, None
         if depth < len(self.killer_moves):
             k1, k2 = self.killer_moves[depth]
+        use_merge = depth <= 1
+        group_map = group_sizes = group_owner = None
+        if use_merge:
+            group_map, group_sizes, group_owner = self._build_groups()
         
         for move in moves:
             score = self.heuristic_move_score(move) + self.history_table[move]
+            if use_merge and group_map is not None:
+                score += self._static_merge_score(
+                    move, group_map, group_sizes, group_owner
+                )
             if tt_move and move == tt_move and not seen_tt:
                 score += 5000
                 seen_tt = True
@@ -531,21 +539,48 @@ class CommandInterface:
         
         return score
 
+    def _static_merge_score(self, move, group_map, group_sizes, group_owner):
+        x, y = move
+        if self.board[y][x] != 0:
+            return 0
+        p = self.to_play
+        opp = 2 if p == 1 else 1
+        my_groups = set()
+        opp_groups = set()
+        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.width and 0 <= ny < self.height:
+                gid = group_map[ny][nx]
+                if gid == -1:
+                    continue
+                owner = group_owner[gid]
+                if owner == p:
+                    my_groups.add(gid)
+                elif owner == opp:
+                    opp_groups.add(gid)
+        bonus = 0
+        if my_groups:
+            bonus += 0.5 * self._merge_gain_from_groups(my_groups, group_sizes)
+        if opp_groups:
+            bonus += 0.4 * self._merge_gain_from_groups(opp_groups, group_sizes)
+        return bonus
+
     # --- Evaluation ---
 
     def evaluate_position(self):
         p1_score, p2_score = self.calculate_score()
         base = p1_score - p2_score if self.to_play == 1 else p2_score - p1_score
         
+        group_map, group_sizes, group_owner = self._build_groups()
+        merge_val = self.calc_merge_potential(group_map, group_sizes, group_owner)
         potential = self.estimate_potential_score()
         pattern = self.pattern_eval()
         mobility = self._mobility_score()
-        merge_val = self.calc_merge_potential()
         
-        return base + potential + 0.4 * pattern + 0.3 * mobility + 0.2 * merge_val
+        return base + potential + 0.4 * pattern + 0.3 * mobility + 0.25 * merge_val
 
-    def calc_merge_potential(self):
-        """Evaluate merge opportunities for both players."""
+    def calc_merge_potential(self, group_map, group_sizes, group_owner):
+        """Evaluate merge opportunities using exact exponential gains."""
         p = self.to_play
         opp = 2 if p == 1 else 1
         my_merge = 0
@@ -555,25 +590,34 @@ class CommandInterface:
             for x in range(self.width):
                 if self.board[y][x] != 0:
                     continue
-                # Count orthogonal neighbors for each player
-                my_adj = 0
-                opp_adj = 0
+                my_groups = set()
+                opp_groups = set()
                 for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
                     nx, ny = x + dx, y + dy
                     if 0 <= nx < self.width and 0 <= ny < self.height:
-                        cell = self.board[ny][nx]
-                        if cell == p:
-                            my_adj += 1
-                        elif cell == opp:
-                            opp_adj += 1
-                
-                # 2+ neighbors means potential merge
-                if my_adj >= 2:
-                    my_merge += my_adj * 2
-                if opp_adj >= 2:
-                    opp_merge += opp_adj * 2
+                        gid = group_map[ny][nx]
+                        if gid == -1:
+                            continue
+                        owner = group_owner[gid]
+                        if owner == p:
+                            my_groups.add(gid)
+                        elif owner == opp:
+                            opp_groups.add(gid)
+                if len(my_groups) >= 1:
+                    my_merge += self._merge_gain_from_groups(my_groups, group_sizes)
+                if len(opp_groups) >= 1:
+                    opp_merge += self._merge_gain_from_groups(opp_groups, group_sizes)
         
         return my_merge - 0.9 * opp_merge
+
+    def _merge_gain_from_groups(self, groups, group_sizes):
+        merged_size = 1  # include the new stone
+        current_score = 0
+        for gid in groups:
+            size = group_sizes.get(gid, 0)
+            merged_size += size
+            current_score += self._line_score(size)
+        return self._line_score(merged_size) - current_score
 
     def estimate_potential_score(self):
         p = self.to_play
@@ -648,6 +692,42 @@ class CommandInterface:
                     for dx, dy in self.pattern_dirs:
                         score += self._score_line(x, y, dx, dy, player)
         return score
+
+    def _build_groups(self):
+        group_map = [[-1 for _ in range(self.width)] for _ in range(self.height)]
+        group_sizes = {}
+        group_owner = {}
+        gid = 0
+        for y in range(self.height):
+            for x in range(self.width):
+                player = self.board[y][x]
+                if player == 0 or group_map[y][x] != -1:
+                    continue
+                size = self._flood_fill_group(x, y, player, gid, group_map)
+                group_sizes[gid] = size
+                group_owner[gid] = player
+                gid += 1
+        return group_map, group_sizes, group_owner
+
+    def _flood_fill_group(self, x, y, player, gid, group_map):
+        stack = [(x, y)]
+        group_map[y][x] = gid
+        size = 0
+        while stack:
+            cx, cy = stack.pop()
+            size += 1
+            for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < self.width and 0 <= ny < self.height:
+                    if self.board[ny][nx] == player and group_map[ny][nx] == -1:
+                        group_map[ny][nx] = gid
+                        stack.append((nx, ny))
+        return size
+
+    def _line_score(self, length):
+        if length <= 0:
+            return 0
+        return 1 << (length - 1)
 
     def _score_line(self, x, y, dx, dy, player):
         length = 1
