@@ -487,17 +487,9 @@ class CommandInterface:
         k1, k2 = None, None
         if depth < len(self.killer_moves):
             k1, k2 = self.killer_moves[depth]
-        use_merge = depth <= 1
-        group_map = group_sizes = group_owner = None
-        if use_merge:
-            group_map, group_sizes, group_owner = self._build_groups()
         
         for move in moves:
             score = self.heuristic_move_score(move) + self.history_table[move]
-            if use_merge and group_map is not None:
-                score += self._static_merge_score(
-                    move, group_map, group_sizes, group_owner
-                )
             if tt_move and move == tt_move and not seen_tt:
                 score += 5000
                 seen_tt = True
@@ -570,14 +562,10 @@ class CommandInterface:
     def evaluate_position(self):
         p1_score, p2_score = self.calculate_score()
         base = p1_score - p2_score if self.to_play == 1 else p2_score - p1_score
-        
-        group_map, group_sizes, group_owner = self._build_groups()
-        merge_val = self.calc_merge_potential(group_map, group_sizes, group_owner)
         potential = self.estimate_potential_score()
         pattern = self.pattern_eval()
         mobility = self._mobility_score()
-        
-        return base + potential + 0.4 * pattern + 0.3 * mobility + 0.25 * merge_val
+        return base + potential + 0.4 * pattern + 0.3 * mobility
 
     def calc_merge_potential(self, group_map, group_sizes, group_owner):
         """Evaluate merge opportunities using exact exponential gains."""
