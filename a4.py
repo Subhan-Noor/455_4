@@ -386,22 +386,10 @@ class CommandInterface:
         best_move = root_moves[0]
         depth = 1
         last_depth_time = 0.0
-        prev_value = 0.0
         while True:
             depth_start = time.perf_counter()
             try:
-                root_moves = self.order_moves(self.get_moves(), None, 0, pv_move)
-                if depth > 1 and prev_value != 0.0:
-                    window = 50.0
-                    alpha = prev_value - window
-                    beta = prev_value + window
-                    value, move = self.negamax_alpha_beta(0, alpha, beta, depth)
-                    if value <= alpha:
-                        value, move = self.negamax_alpha_beta(0, -float('inf'), beta, depth)
-                    elif value >= beta:
-                        value, move = self.negamax_alpha_beta(0, alpha, float('inf'), depth)
-                else:
-                    value, move = self.negamax_alpha_beta(0, -float('inf'), float('inf'), depth)
+                value, move = self.negamax_alpha_beta(0, -float('inf'), float('inf'), depth)
             except SearchTimeout:
                 break
             depth_time = time.perf_counter() - depth_start
@@ -409,7 +397,6 @@ class CommandInterface:
             if move is not None:
                 best_move = move
                 pv_move = move
-                prev_value = value
             depth += 1
             if time.perf_counter() + max(0.01, last_depth_time * 1.75) > self.search_deadline:
                 break
@@ -421,8 +408,7 @@ class CommandInterface:
         if terminal:
             return rel_score, None
         if depth >= max_depth:
-            remaining = max_depth - depth
-            return self.evaluate_position(remaining), None
+            return self.evaluate_position(), None
 
         remaining = max_depth - depth
         entry = self._probe_tt()
@@ -505,25 +491,31 @@ class CommandInterface:
         if depth < len(self.killer_moves):
             k1, k2 = self.killer_moves[depth]
         
-        use_merge = depth <= 1
+        # Only build groups at shallow depths (cheap and effective for ordering)
+        use_merge = depth == 0
         group_map = group_sizes = group_owner = None
         if use_merge:
             group_map, group_sizes, group_owner = self._build_groups()
         
         for move in moves:
-            score = self.heuristic_move_score(move) + self.history_table[move]
-            if use_merge and group_map is not None:
-                score += self._static_merge_score(move, group_map, group_sizes, group_owner)
+            score = 0
+            
+            # PV move gets highest priority
             if pv_move and move == pv_move and not seen_pv:
-                score += 6000
+                score = 10000
                 seen_pv = True
             elif tt_move and move == tt_move and not seen_tt:
-                score += 5000
+                score = 8000
                 seen_tt = True
             elif move == k1:
-                score += 2000
+                score = 5000
             elif move == k2:
-                score += 1500
+                score = 3000
+            else:
+                score = self.heuristic_move_score(move) + self.history_table[move]
+                if use_merge and group_map is not None:
+                    score += self._static_merge_score(move, group_map, group_sizes, group_owner)
+            
             ordered.append((score, move))
         ordered.sort(key=lambda item: item[0], reverse=True)
         return [move for _, move in ordered]
@@ -586,19 +578,12 @@ class CommandInterface:
 
     # --- Evaluation ---
 
-    def evaluate_position(self, remaining_depth=0):
+    def evaluate_position(self):
         p1_score, p2_score = self.calculate_score()
         base = p1_score - p2_score if self.to_play == 1 else p2_score - p1_score
         potential = self.estimate_potential_score()
         pattern = self.pattern_eval()
-        mobility = self._mobility_score()
-        
-        merge_pot = 0.0
-        if remaining_depth <= 2:
-            group_map, group_sizes, group_owner = self._build_groups()
-            merge_pot = self.calc_merge_potential(group_map, group_sizes, group_owner)
-        
-        return base + 0.5 * potential + 0.6 * pattern + 0.2 * mobility + 0.7 * merge_pot
+        return base + potential + 0.4 * pattern
 
     def calc_merge_potential(self, group_map, group_sizes, group_owner):
         """Evaluate merge opportunities using exact exponential gains."""
