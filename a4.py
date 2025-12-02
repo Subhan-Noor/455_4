@@ -28,6 +28,13 @@ class CommandInterface:
         self.time_limit = 1
         # Internal flag used by the search to stop when time is up
         self._time_up = False
+        # Move count for O(1) empty counting
+        self.move_count = 0
+        # Principal variation move from previous iteration
+        self._pv_move = None
+        # Transposition table: board_hash -> (depth, value, flag)
+        # flag: 'exact', 'lower', 'upper'
+        self._tt = {}
 
     # Convert a raw string to a command and a list of arguments
     def process_command(self, s):
@@ -123,6 +130,9 @@ class CommandInterface:
         self.to_play = 1
         self.p1_score = 0
         self.p2_score = self.handicap
+        self.move_count = 0
+        self._pv_move = None
+        self._tt = {}  # Clear transposition table for new game
         return True
 
     def show(self, args):
@@ -173,11 +183,16 @@ class CommandInterface:
 
     def _board_full(self):
         """Return True if there are no empty points left."""
-        for row in self.board:
-            for v in row:
-                if v == 0:
-                    return False
-        return True
+        return self.move_count >= self.width * self.height
+
+    def _get_empties(self):
+        """Return count of empty squares."""
+        return self.width * self.height - self.move_count
+
+    def _board_hash(self):
+        """Simple hash for transposition table."""
+        # Include to_play in hash to distinguish positions
+        return (tuple(tuple(row) for row in self.board), self.to_play)
 
     def _evaluate(self):
         """
@@ -222,15 +237,48 @@ class CommandInterface:
         Standard negamax with alpha-beta pruning.
         Values are always from the perspective of the player to move
         (self.to_play) at this node.
+        
+        Includes:
+        - Late-game full-width search (ignores depth when few empties remain)
+        - Transposition table for caching
         """
         # Time check
         if time.perf_counter() >= deadline:
             self._time_up = True
             return self._evaluate()
 
-        # Leaf node: depth limit or full board -> evaluate
-        if depth == 0 or self._board_full():
+        # Terminal: board full
+        if self._board_full():
             return self._evaluate()
+
+        empties = self._get_empties()
+        
+        # Late-game full-width search: when few empties remain, search to terminal
+        # This is where AB excels over MCTS
+        ENDGAME_THRESHOLD = 12
+        if empties <= ENDGAME_THRESHOLD:
+            # In endgame: ignore depth limit, search to terminal
+            effective_depth = empties
+        else:
+            # Normal search: respect depth limit
+            if depth == 0:
+                return self._evaluate()
+            effective_depth = depth
+
+        # Transposition table lookup
+        alpha_orig = alpha
+        board_key = self._board_hash()
+        if board_key in self._tt:
+            tt_depth, tt_val, tt_flag = self._tt[board_key]
+            if tt_depth >= effective_depth:
+                if tt_flag == 'exact':
+                    return tt_val
+                elif tt_flag == 'lower':
+                    alpha = max(alpha, tt_val)
+                elif tt_flag == 'upper':
+                    beta = min(beta, tt_val)
+                if alpha >= beta:
+                    return tt_val
 
         moves = self.get_moves()
         if not moves:
@@ -244,7 +292,7 @@ class CommandInterface:
 
         for (x, y) in moves:
             self.make_move(x, y)
-            val = -self._negamax(depth - 1, -beta, -alpha, deadline)
+            val = -self._negamax(effective_depth - 1, -beta, -alpha, deadline)
             self.undo_move(x, y)
 
             if self._time_up:
@@ -260,11 +308,22 @@ class CommandInterface:
                 # Beta cutoff
                 break
 
+        # Store in transposition table
+        if not self._time_up:
+            if best <= alpha_orig:
+                tt_flag = 'upper'
+            elif best >= beta:
+                tt_flag = 'lower'
+            else:
+                tt_flag = 'exact'
+            self._tt[board_key] = (effective_depth, best, tt_flag)
+
         return best
 
     def _root_search(self, max_depth, deadline):
         """
         Root-level search: returns (best_move, best_value) for the given depth.
+        Uses PV move ordering: try best move from previous iteration first.
         """
         best_move = None
         best_val = -float("inf")
@@ -273,8 +332,13 @@ class CommandInterface:
         if not moves:
             return None, 0.0
 
-        # Order moves at root too
+        # Order moves: PV move first, then by heuristic
         moves.sort(key=self._move_order_key, reverse=True)
+        
+        # Put PV move from previous iteration first (if valid)
+        if self._pv_move is not None and self._pv_move in moves:
+            moves.remove(self._pv_move)
+            moves.insert(0, self._pv_move)
 
         alpha = -float("inf")
         beta = float("inf")
@@ -309,6 +373,7 @@ class CommandInterface:
 
     def make_move(self, x, y):
         self.board[y][x] = self.to_play
+        self.move_count += 1
         if self.to_play == 1:
             self.to_play = 2
         else:
@@ -316,6 +381,7 @@ class CommandInterface:
 
     def undo_move(self, x, y):
         self.board[y][x] = 0
+        self.move_count -= 1
         if self.to_play == 1:
             self.to_play = 2
         else:
@@ -415,6 +481,12 @@ class CommandInterface:
         """
         Generate and play a move using iterative deepening alpha-beta search.
         Respects self.time_limit (seconds) with a small safety margin.
+        
+        Features:
+        - Iterative deepening for time management
+        - PV move ordering (best move from previous depth searched first)
+        - Late-game full-width search (handled in _negamax)
+        - Transposition table for caching
         """
         moves = self.get_moves()
         if not moves:
@@ -429,8 +501,13 @@ class CommandInterface:
         deadline = start + max(0.01, 0.9 * effective_limit)
 
         # Fallback: if search fails or times out very early, play the first move
+        # Use move ordering heuristic for the fallback
+        moves.sort(key=self._move_order_key, reverse=True)
         best_move = moves[0]
         best_val = -float("inf")
+
+        # Reset PV move for this search
+        self._pv_move = None
 
         depth = 1
         # Iterative deepening: increase depth until time runs out
@@ -442,6 +519,7 @@ class CommandInterface:
             # update our best answer and go deeper.
             if not self._time_up and move is not None:
                 best_move, best_val = move, val
+                self._pv_move = move  # Save PV move for next iteration
                 depth += 1
 
                 # In theory we can't search deeper than number of empty squares
