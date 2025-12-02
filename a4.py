@@ -3,6 +3,7 @@
 # Full assignment specification on Canvas
 
 import sys
+import time
 
 class CommandInterface:
     # The following is already defined and does not need modification
@@ -25,6 +26,8 @@ class CommandInterface:
         self.handicap = 0.0
         self.score_cutoff = float("inf")
         self.time_limit = 1
+        # Internal flag used by the search to stop when time is up
+        self._time_up = False
 
     # Convert a raw string to a command and a list of arguments
     def process_command(self, s):
@@ -164,6 +167,136 @@ class CommandInterface:
         print(p1_score, p2_score)
         return True
     
+    # -----------------------------
+    # Search helpers for genmove()
+    # -----------------------------
+
+    def _board_full(self):
+        """Return True if there are no empty points left."""
+        for row in self.board:
+            for v in row:
+                if v == 0:
+                    return False
+        return True
+
+    def _evaluate(self):
+        """
+        Heuristic evaluation: score difference from the perspective
+        of the current player (self.to_play).
+        """
+        p1_score, p2_score = self.calculate_score()
+        if self.to_play == 1:
+            return p1_score - p2_score
+        else:
+            return p2_score - p1_score
+
+    def _move_order_key(self, move):
+        """
+        Move ordering heuristic:
+        - Prefer moves near the center
+        - Prefer moves adjacent to existing stones
+        """
+        x, y = move
+
+        # Center preference (negative squared distance from center)
+        cx = (self.width - 1) / 2.0
+        cy = (self.height - 1) / 2.0
+        center_score = -((x - cx) ** 2 + (y - cy) ** 2)
+
+        # Adjacency score: count neighboring stones (8 directions)
+        adj = 0
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < self.width and 0 <= ny < self.height:
+                    if self.board[ny][nx] != 0:
+                        adj += 1
+
+        # Adjacency dominates, center breaks ties
+        return adj * 10.0 + center_score
+
+    def _negamax(self, depth, alpha, beta, deadline):
+        """
+        Standard negamax with alpha-beta pruning.
+        Values are always from the perspective of the player to move
+        (self.to_play) at this node.
+        """
+        # Time check
+        if time.perf_counter() >= deadline:
+            self._time_up = True
+            return self._evaluate()
+
+        # Leaf node: depth limit or full board -> evaluate
+        if depth == 0 or self._board_full():
+            return self._evaluate()
+
+        moves = self.get_moves()
+        if not moves:
+            # Safety: no legal moves, treat as leaf
+            return self._evaluate()
+
+        # Move ordering to improve alpha-beta pruning
+        moves.sort(key=self._move_order_key, reverse=True)
+
+        best = -float("inf")
+
+        for (x, y) in moves:
+            self.make_move(x, y)
+            val = -self._negamax(depth - 1, -beta, -alpha, deadline)
+            self.undo_move(x, y)
+
+            if self._time_up:
+                # Time is up: return the best value found so far (if any),
+                # or a safe fallback of 0.
+                return best if best != -float("inf") else 0.0
+
+            if val > best:
+                best = val
+            if val > alpha:
+                alpha = val
+            if alpha >= beta:
+                # Beta cutoff
+                break
+
+        return best
+
+    def _root_search(self, max_depth, deadline):
+        """
+        Root-level search: returns (best_move, best_value) for the given depth.
+        """
+        best_move = None
+        best_val = -float("inf")
+
+        moves = self.get_moves()
+        if not moves:
+            return None, 0.0
+
+        # Order moves at root too
+        moves.sort(key=self._move_order_key, reverse=True)
+
+        alpha = -float("inf")
+        beta = float("inf")
+
+        for (x, y) in moves:
+            self.make_move(x, y)
+            val = -self._negamax(max_depth - 1, -beta, -alpha, deadline)
+            self.undo_move(x, y)
+
+            if self._time_up:
+                # Time ran out during child search, stop and keep what we have
+                break
+
+            if val > best_val or best_move is None:
+                best_val = val
+                best_move = (x, y)
+
+            if val > alpha:
+                alpha = val
+
+        return best_move, best_val
+    
     # Optional helper functions that you may use or replace with your own.
 
     def get_moves(self):
@@ -279,7 +412,51 @@ class CommandInterface:
     # Make sure you print a move within the specified time limit (1 second by default)
     # Print the x and y coordinates of your chosen move, space separated.
     def genmove(self, args):
-        return False
+        """
+        Generate and play a move using iterative deepening alpha-beta search.
+        Respects self.time_limit (seconds) with a small safety margin.
+        """
+        moves = self.get_moves()
+        if not moves:
+            # No legal moves (should only happen on full board)
+            # Output something legal-ish just in case
+            print("0 0")
+            return True
+
+        start = time.perf_counter()
+        # Safety: don't use full timelimit, and handle t=0 gracefully
+        effective_limit = max(0.001, float(self.time_limit))
+        deadline = start + max(0.01, 0.9 * effective_limit)
+
+        # Fallback: if search fails or times out very early, play the first move
+        best_move = moves[0]
+        best_val = -float("inf")
+
+        depth = 1
+        # Iterative deepening: increase depth until time runs out
+        while True:
+            self._time_up = False
+            move, val = self._root_search(depth, deadline)
+
+            # If we completed this depth within the time limit and found a move,
+            # update our best answer and go deeper.
+            if not self._time_up and move is not None:
+                best_move, best_val = move, val
+                depth += 1
+
+                # In theory we can't search deeper than number of empty squares
+                if depth > self.width * self.height:
+                    break
+            else:
+                # Either time ran out or something went wrong at this depth
+                break
+
+        x, y = best_move
+        # Play the move on our internal board
+        self.make_move(x, y)
+        # Print the coordinates as required: "x y"
+        print(x, y)
+        return True
 
 if __name__ == "__main__":
     interface = CommandInterface()
