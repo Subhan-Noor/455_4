@@ -385,16 +385,30 @@ class CommandInterface:
         best_move = root_moves[0]
         depth = 1
         last_depth_time = 0.0
+        prev_value = 0.0
+        pv_move = None
         while True:
             depth_start = time.perf_counter()
             try:
-                value, move = self.negamax_alpha_beta(0, -float('inf'), float('inf'), depth)
+                if depth > 1 and prev_value != 0.0:
+                    window = 50.0
+                    alpha = prev_value - window
+                    beta = prev_value + window
+                    value, move = self.negamax_alpha_beta(0, alpha, beta, depth)
+                    if value <= alpha:
+                        value, move = self.negamax_alpha_beta(0, -float('inf'), beta, depth)
+                    elif value >= beta:
+                        value, move = self.negamax_alpha_beta(0, alpha, float('inf'), depth)
+                else:
+                    value, move = self.negamax_alpha_beta(0, -float('inf'), float('inf'), depth)
             except SearchTimeout:
                 break
             depth_time = time.perf_counter() - depth_start
             last_depth_time = depth_time
             if move is not None:
                 best_move = move
+                pv_move = move
+                prev_value = value
             depth += 1
             if time.perf_counter() + max(0.01, last_depth_time * 1.75) > self.search_deadline:
                 break
@@ -479,18 +493,22 @@ class CommandInterface:
         idx = self.current_hash & (self.tt_size - 1)
         self.transposition_table[idx] = (self.current_hash, depth, value, flag, best_move)
 
-    def order_moves(self, moves, tt_move, depth=0):
+    def order_moves(self, moves, tt_move, depth=0, pv_move=None):
         if not moves:
             return []
         ordered = []
         seen_tt = False
+        seen_pv = False
         k1, k2 = None, None
         if depth < len(self.killer_moves):
             k1, k2 = self.killer_moves[depth]
         
         for move in moves:
             score = self.heuristic_move_score(move) + self.history_table[move]
-            if tt_move and move == tt_move and not seen_tt:
+            if pv_move and move == pv_move and not seen_pv:
+                score += 6000
+                seen_pv = True
+            elif tt_move and move == tt_move and not seen_tt:
                 score += 5000
                 seen_tt = True
             elif move == k1:
