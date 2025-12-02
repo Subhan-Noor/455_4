@@ -400,6 +400,21 @@ class CommandInterface:
             depth += 1
             if time.perf_counter() + max(0.01, last_depth_time * 1.75) > self.search_deadline:
                 break
+        
+        # Flat MC reranking: if we have time, validate top candidates with playouts
+        time_remaining = self.search_deadline - time.perf_counter()
+        if time_remaining > 0.15 and len(root_moves) >= 2:
+            try:
+                # Get top 3 candidates for MC validation
+                candidates = self.order_moves(self.get_moves(), None, 0, best_move)[:3]
+                if best_move not in candidates:
+                    candidates = [best_move] + candidates[:2]
+                mc_move = self._flat_mc_rerank(candidates, playouts_per_move=4)
+                if mc_move is not None:
+                    best_move = mc_move
+            except SearchTimeout:
+                pass  # Keep alpha-beta's choice
+        
         return best_move
 
     def negamax_alpha_beta(self, depth, alpha, beta, max_depth):
@@ -408,6 +423,11 @@ class CommandInterface:
         if terminal:
             return rel_score, None
         if depth >= max_depth:
+            # Quiescence: extend 1 ply if there's a big merge tactic (horizon effect)
+            if depth == max_depth and max_depth >= 3:
+                ext_val, ext_move = self._quiescence_extension(alpha, beta)
+                if ext_move is not None:
+                    return ext_val, ext_move
             return self.evaluate_position(), None
 
         remaining = max_depth - depth
@@ -575,6 +595,114 @@ class CommandInterface:
         if opp_groups:
             bonus += 0.8 * self._merge_gain_from_groups(opp_groups, group_sizes)
         return bonus
+
+    # --- Quiescence Extension (horizon effect mitigation) ---
+
+    def _quiescence_extension(self, alpha, beta, threshold=12):
+        """
+        If there's a big merge opportunity, search 1 ply deeper for top tactical moves.
+        This addresses the horizon effect where a huge merge is just beyond search depth.
+        """
+        group_map, group_sizes, group_owner = self._build_groups()
+        tactical_moves = []
+        
+        for move in self.get_moves():
+            gain = self._static_merge_score(move, group_map, group_sizes, group_owner)
+            if gain >= threshold:
+                tactical_moves.append((gain, move))
+        
+        if not tactical_moves:
+            return self.evaluate_position(), None
+        
+        # Sort by gain, take top 3 moves
+        tactical_moves.sort(reverse=True)
+        tactical_moves = tactical_moves[:3]
+        
+        best_value = -float('inf')
+        best_move = None
+        
+        for _, move in tactical_moves:
+            self._ensure_time()
+            self.make_move(*move)
+            try:
+                # One-ply extension: just evaluate after the move
+                child_val = -self.evaluate_position()
+            finally:
+                self.undo_move(*move)
+            
+            if child_val > best_value:
+                best_value = child_val
+                best_move = move
+            if child_val > alpha:
+                alpha = child_val
+            if alpha >= beta:
+                break
+        
+        return best_value, best_move
+
+    # --- Flat Monte Carlo validation ---
+
+    def _flat_mc_rerank(self, candidates, playouts_per_move=4):
+        """
+        Use random playouts to validate/rerank top candidates from alpha-beta.
+        Returns the move with best average playout result.
+        """
+        if len(candidates) <= 1:
+            return candidates[0] if candidates else None
+        
+        mc_scores = {}
+        for move in candidates:
+            total = 0.0
+            for _ in range(playouts_per_move):
+                self._ensure_time()
+                # Save state
+                saved_board = [row[:] for row in self.board]
+                saved_to_play = self.to_play
+                saved_hash = self.current_hash
+                
+                self.make_move(*move)
+                total += self._random_playout()
+                
+                # Restore state
+                self.board = saved_board
+                self.to_play = saved_to_play
+                self.current_hash = saved_hash
+            
+            mc_scores[move] = total / playouts_per_move
+        
+        # Return move with best MC score
+        return max(mc_scores.items(), key=lambda kv: kv[1])[0]
+
+    def _random_playout(self):
+        """
+        Play random moves until terminal, return relative score from original player's POV.
+        """
+        original_player = 2 if self.to_play == 1 else 1  # who just moved
+        moves_made = []
+        
+        while True:
+            terminal, _ = self.get_relative_score()
+            if terminal:
+                break
+            moves = self.get_moves()
+            if not moves:
+                break
+            move = self.rand.choice(moves)
+            self.make_move(*move)
+            moves_made.append(move)
+        
+        # Get final score from original player's perspective
+        p1_score, p2_score = self.calculate_score()
+        if original_player == 1:
+            result = p1_score - p2_score
+        else:
+            result = p2_score - p1_score
+        
+        # Undo all moves
+        for move in reversed(moves_made):
+            self.undo_move(*move)
+        
+        return result
 
     # --- Evaluation ---
 
