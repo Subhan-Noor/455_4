@@ -506,48 +506,28 @@ class CommandInterface:
         p = self.to_play
         opp = 2 if p == 1 else 1
         
-        # Count orthogonal neighbors (scoring is based on orthogonal lines)
-        my_orth = 0
-        opp_orth = 0
-        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < self.width and 0 <= ny < self.height:
-                if self.board[ny][nx] == p:
-                    my_orth += 1
-                elif self.board[ny][nx] == opp:
-                    opp_orth += 1
-        
-        # Count diagonal neighbors (less important but still useful)
-        my_diag = 0
-        opp_diag = 0
-        for dx, dy in [(1, 1), (1, -1), (-1, 1), (-1, -1)]:
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < self.width and 0 <= ny < self.height:
-                if self.board[ny][nx] == p:
-                    my_diag += 1
-                elif self.board[ny][nx] == opp:
-                    opp_diag += 1
-        
-        score = 0
-        # Connecting multiple own pieces orthogonally = high priority
-        if my_orth >= 2:
-            score += 150 + my_orth * 30
-        elif my_orth == 1:
-            score += 25
-        
-        # Blocking opponent connections = defensive priority
-        if opp_orth >= 2:
-            score += 120 + opp_orth * 25
-        elif opp_orth == 1:
-            score += 15
-        
-        # Diagonal adjacency (smaller bonus)
-        score += my_diag * 8 + opp_diag * 5
-        
-        # Center preference
+        # Center preference (important for opening)
         cx, cy = self.width // 2, self.height // 2
-        dist = abs(x - cx) + abs(y - cy)
-        score += (7 - dist) * 3
+        center_bonus = (self.width - abs(x - cx)) + (self.height - abs(y - cy))
+        
+        # Count all neighbors
+        my_adj = 0
+        opp_adj = 0
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < self.width and 0 <= ny < self.height:
+                    if self.board[ny][nx] == p:
+                        my_adj += 1
+                    elif self.board[ny][nx] == opp:
+                        opp_adj += 1
+        
+        # Balanced scoring
+        score = center_bonus * 3
+        score += my_adj * 8
+        score += opp_adj * 4
         
         return score
 
@@ -557,10 +537,12 @@ class CommandInterface:
         p1_score, p2_score = self.calculate_score()
         base = p1_score - p2_score if self.to_play == 1 else p2_score - p1_score
         
-        merge_val = self.calc_merge_potential()
+        potential = self.estimate_potential_score()
         pattern = self.pattern_eval()
+        mobility = self._mobility_score()
+        merge_val = self.calc_merge_potential()
         
-        return base + 0.7 * merge_val + 0.25 * pattern
+        return base + potential + 0.4 * pattern + 0.3 * mobility + 0.2 * merge_val
 
     def calc_merge_potential(self):
         """Evaluate merge opportunities for both players."""
