@@ -580,7 +580,11 @@ class CommandInterface:
 
     def evaluate_position(self):
         p1_score, p2_score = self.calculate_score()
-        base = p1_score - p2_score if self.to_play == 1 else p2_score - p1_score
+        if self.to_play == 1:
+            base = p1_score - p2_score  # same as before
+        else:
+            # normalize away some of the handicap so P2 stays aggressive
+            base = (p2_score - p1_score) - 3.0
         potential = self.estimate_potential_score()
         pattern = self.pattern_eval()
         return base + potential + 0.4 * pattern
