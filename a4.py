@@ -337,8 +337,6 @@ class CommandInterface:
         ordered.extend([m for _, m in scored])
         return ordered
 
-    # ==================== MCTS with RAVE ====================
-    
     def _advance_mcts_root(self, move):
         if self._mcts_root is None:
             return
@@ -352,55 +350,48 @@ class CommandInterface:
         root_player = self.to_play
         
         if self._mcts_root is None:
-            root = MCTSNode(parent=None, move=None, player=3 - self.to_play)
+            root = MCTSNode(parent=None, move=None, player=None)
             root.untried_moves = list(self.get_moves())
         else:
             root = self._mcts_root
             if root.untried_moves is None:
                 root.untried_moves = list(self.get_moves())
         
-        simulations = 0
-        
         while time.perf_counter() < deadline - 0.01:
             node = root
             move_stack = []
             amaf = {1: set(), 2: set()}
             
-            # selection
             while node.untried_moves is not None and len(node.untried_moves) == 0:
                 if not node.children:
                     break
                 node = self._uct_rave_select(node)
+                player_moved = node.player
                 self.make_move(*node.move)
                 move_stack.append(node.move)
-                amaf[node.player].add(node.move)
+                amaf[player_moved].add(node.move)
             
-            # expansion
             if node.untried_moves is None:
                 node.untried_moves = list(self.get_moves())
             
             if node.untried_moves:
                 move = self._pick_expansion_move(node.untried_moves)
                 node.untried_moves.remove(move)
+                player_moved = self.to_play
                 self.make_move(*move)
                 move_stack.append(move)
                 
-                child = MCTSNode(parent=node, move=move, player=self.to_play)
+                child = MCTSNode(parent=node, move=move, player=player_moved)
                 node.children[move] = child
                 node = child
-                amaf[node.player].add(move)
+                amaf[player_moved].add(move)
             
-            # simulation (full rollout)
             value = self._mcts_rollout(root_player, amaf)
             
-            # undo moves
             while move_stack:
                 self.undo_move(*move_stack.pop())
             
-            # backprop with RAVE
-            self._backprop_rave(node, value, amaf, root_player)
-            
-            simulations += 1
+            self._backprop_rave(node, value, amaf)
         
         self._mcts_root = root
         
@@ -469,9 +460,10 @@ class CommandInterface:
                 break
             
             move = self._rollout_policy(moves)
+            player_moved = self.to_play
             self.make_move(*move)
-            rollout_moves.append((move, self.to_play))
-            amaf[3 - self.to_play].add(move)
+            rollout_moves.append(move)
+            amaf[player_moved].add(move)
         
         p1_score, p2_score = self.calculate_score()
         diff = p1_score - p2_score
@@ -480,8 +472,7 @@ class CommandInterface:
             diff = -diff
         
         while rollout_moves:
-            move, _ = rollout_moves.pop()
-            self.undo_move(*move)
+            self.undo_move(*rollout_moves.pop())
         
         return max(-1.0, min(1.0, diff / 120.0))
 
@@ -523,27 +514,19 @@ class CommandInterface:
         
         return best_move
 
-    def _backprop_rave(self, leaf, value, amaf, root_player):
+    def _backprop_rave(self, leaf, value, amaf):
         node = leaf
         while node is not None:
             node.visits += 1
-            if node.player == root_player:
-                node.value += value
-            else:
-                node.value -= value
+            node.value += value
             
             if node.parent is not None:
                 for sib_move, sib in node.parent.children.items():
                     if sib_move in amaf.get(sib.player, set()):
                         sib.rave_visits += 1
-                        if sib.player == root_player:
-                            sib.rave_value += value
-                        else:
-                            sib.rave_value -= value
+                        sib.rave_value += value
             
             node = node.parent
-
-    # ==================== ALPHA-BETA ====================
 
     def _negamax(self, depth, alpha, beta, deadline):
         if time.perf_counter() >= deadline:
@@ -823,7 +806,6 @@ class CommandInterface:
         
         empties = self._get_empties()
         
-        # hybrid: MCTS for opening/midgame, AB for endgame
         if empties >= 18:
             move = self._mcts_select_move(deadline)
         else:
