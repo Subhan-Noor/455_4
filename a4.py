@@ -4,6 +4,7 @@
 
 import sys
 import time
+import random
 
 class CommandInterface:
     # The following is already defined and does not need modification
@@ -28,8 +29,17 @@ class CommandInterface:
         self.time_limit = 1
         self._time_up = False
         self.move_count = 0
-        self._pv_move = None
+        
+        # zobrist hashing
+        self.zobrist_table = None
+        self.zobrist_player = None
+        self.current_hash = 0
+        
+        # transposition table and search state
         self._tt = {}
+        self._pv_move = None
+        self.killer_moves = {}
+        self.history = {}
 
     # Convert a raw string to a command and a list of arguments
     def process_command(self, s):
@@ -96,6 +106,16 @@ class CommandInterface:
     # Command functions needed for playing.
     # Feel free to modify them if needed, but keep their functionality intact.
 
+    def init_zobrist(self):
+        random.seed(42)
+        self.zobrist_table = {}
+        for y in range(self.height):
+            for x in range(self.width):
+                for player in [1, 2]:
+                    self.zobrist_table[(x, y, player)] = random.getrandbits(64)
+        self.zobrist_player = [random.getrandbits(64), random.getrandbits(64)]
+        self.current_hash = self.zobrist_player[self.to_play - 1]
+
     # init_game w h p s
     def init_game(self, args):
         # Check arguments
@@ -128,6 +148,10 @@ class CommandInterface:
         self.move_count = 0
         self._pv_move = None
         self._tt = {}
+        self.killer_moves = {}
+        self.history = {}
+        
+        self.init_zobrist()
         return True
 
     def show(self, args):
@@ -178,88 +202,173 @@ class CommandInterface:
     def _get_empties(self):
         return self.width * self.height - self.move_count
 
-    def _board_hash(self):
-        return (tuple(tuple(row) for row in self.board), self.to_play)
+    def _count_line(self, x, y, dx, dy, player):
+        length = 0
+        nx, ny = x + dx, y + dy
+        while 0 <= nx < self.width and 0 <= ny < self.height and self.board[ny][nx] == player:
+            length += 1
+            nx += dx
+            ny += dy
+        return length
+
+    def _line_potential(self, x, y, dx, dy, player):
+        fwd = self._count_line(x, y, dx, dy, player)
+        bwd = self._count_line(x, y, -dx, -dy, player)
+        return fwd + bwd
 
     def _evaluate(self):
         p1_score, p2_score = self.calculate_score()
-        if self.to_play == 1:
-            return p1_score - p2_score
-        else:
-            return p2_score - p1_score
+        base = p1_score - p2_score if self.to_play == 1 else p2_score - p1_score
+        
+        # threat analysis - look at line extension potential
+        my_threat = 0
+        opp_threat = 0
+        opp = 3 - self.to_play
+        
+        for y in range(self.height):
+            for x in range(self.width):
+                if self.board[y][x] != 0:
+                    continue
+                for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
+                    my_len = self._line_potential(x, y, dx, dy, self.to_play)
+                    if my_len >= 2:
+                        my_threat += my_len * my_len
+                    opp_len = self._line_potential(x, y, dx, dy, opp)
+                    if opp_len >= 2:
+                        opp_threat += opp_len * opp_len
+        
+        return base + 0.12 * (my_threat - 0.9 * opp_threat)
 
-    def _move_order_key(self, move):
-        x, y = move
-        cx = (self.width - 1) / 2.0
-        cy = (self.height - 1) / 2.0
-        center_score = -((x - cx) ** 2 + (y - cy) ** 2)
+    def _tactical_score(self, x, y):
+        score = 0
+        opp = 3 - self.to_play
+        for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
+            my_len = self._line_potential(x, y, dx, dy, self.to_play)
+            if my_len > 0:
+                score += my_len * my_len * 2
+            opp_len = self._line_potential(x, y, dx, dy, opp)
+            if opp_len > 0:
+                score += opp_len * opp_len
+        return score
 
-        adj = 0
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
+    def _count_adjacent(self, x, y):
+        count = 0
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
                 if dx == 0 and dy == 0:
                     continue
                 nx, ny = x + dx, y + dy
                 if 0 <= nx < self.width and 0 <= ny < self.height:
                     if self.board[ny][nx] != 0:
-                        adj += 1
+                        count += 1
+        return count
 
-        return adj * 10.0 + center_score
+    def _order_moves(self, moves, depth, tt_best):
+        if not moves:
+            return []
+        
+        ordered = []
+        remaining = list(moves)
+        
+        # TT best move first
+        if tt_best and tt_best in remaining:
+            ordered.append(tt_best)
+            remaining.remove(tt_best)
+        
+        # killer moves
+        if depth in self.killer_moves:
+            for killer in self.killer_moves[depth]:
+                if killer in remaining:
+                    ordered.append(killer)
+                    remaining.remove(killer)
+        
+        # score the rest
+        cx = self.width / 2.0
+        cy = self.height / 2.0
+        scored = []
+        for move in remaining:
+            x, y = move
+            s = 0
+            s += self.history.get(move, 0)
+            s += self._tactical_score(x, y) * 500
+            s += self._count_adjacent(x, y) * 200
+            dist = abs(x - cx) + abs(y - cy)
+            s += (10 - dist) * 50
+            scored.append((s, move))
+        
+        scored.sort(reverse=True, key=lambda p: p[0])
+        ordered.extend([m for _, m in scored])
+        return ordered
 
     def _negamax(self, depth, alpha, beta, deadline):
         if time.perf_counter() >= deadline:
             self._time_up = True
-            return self._evaluate()
+            return self._evaluate(), None
 
         if self._board_full():
-            return self._evaluate()
+            return self._evaluate(), None
+
+        if depth == 0:
+            return self._evaluate(), None
 
         empties = self._get_empties()
-        ENDGAME_THRESHOLD = 12
-        
-        if depth == 0:
-            return self._evaluate()
-        
-        if empties <= ENDGAME_THRESHOLD:
+        if empties <= 12:
             effective_depth = min(depth, empties)
         else:
             effective_depth = depth
 
         alpha_orig = alpha
-        board_key = self._board_hash()
-        if board_key in self._tt:
-            tt_depth, tt_val, tt_flag = self._tt[board_key]
+        hash_key = self.current_hash
+        tt_best = None
+        
+        if hash_key in self._tt:
+            tt_depth, tt_val, tt_flag, tt_move = self._tt[hash_key]
+            tt_best = tt_move
             if tt_depth >= effective_depth:
                 if tt_flag == 'exact':
-                    return tt_val
+                    return tt_val, tt_move
                 elif tt_flag == 'lower':
                     alpha = max(alpha, tt_val)
                 elif tt_flag == 'upper':
                     beta = min(beta, tt_val)
                 if alpha >= beta:
-                    return tt_val
+                    return tt_val, tt_move
 
         moves = self.get_moves()
         if not moves:
-            return self._evaluate()
+            return self._evaluate(), None
 
-        moves.sort(key=self._move_order_key, reverse=True)
+        moves = self._order_moves(moves, depth, tt_best)
 
         best = -float("inf")
+        best_move = None
 
-        for (x, y) in moves:
+        for move in moves:
+            x, y = move
             self.make_move(x, y)
-            val = -self._negamax(effective_depth - 1, -beta, -alpha, deadline)
+            val, _ = self._negamax(effective_depth - 1, -beta, -alpha, deadline)
+            val = -val
             self.undo_move(x, y)
 
             if self._time_up:
-                return best if best != -float("inf") else 0.0
+                return best if best != -float("inf") else 0.0, best_move
 
             if val > best:
                 best = val
+                best_move = move
             if val > alpha:
                 alpha = val
             if alpha >= beta:
+                # update killer moves
+                if depth not in self.killer_moves:
+                    self.killer_moves[depth] = []
+                if move not in self.killer_moves[depth]:
+                    self.killer_moves[depth].insert(0, move)
+                    if len(self.killer_moves[depth]) > 2:
+                        self.killer_moves[depth].pop()
+                # history heuristic
+                bonus = depth * depth
+                self.history[move] = self.history.get(move, 0) + bonus
                 break
 
         if not self._time_up:
@@ -269,30 +378,34 @@ class CommandInterface:
                 tt_flag = 'lower'
             else:
                 tt_flag = 'exact'
-            self._tt[board_key] = (effective_depth, best, tt_flag)
+            self._tt[hash_key] = (effective_depth, best, tt_flag, best_move)
 
-        return best
+        return best, best_move
 
-    def _root_search(self, max_depth, deadline):
-        best_move = None
-        best_val = -float("inf")
-
+    def _root_search(self, max_depth, deadline, alpha, beta):
         moves = self.get_moves()
         if not moves:
             return None, 0.0
 
-        moves.sort(key=self._move_order_key, reverse=True)
+        hash_key = self.current_hash
+        tt_best = None
+        if hash_key in self._tt:
+            tt_best = self._tt[hash_key][3]
         
-        if self._pv_move is not None and self._pv_move in moves:
+        moves = self._order_moves(moves, 0, tt_best)
+        
+        if self._pv_move and self._pv_move in moves:
             moves.remove(self._pv_move)
             moves.insert(0, self._pv_move)
 
-        alpha = -float("inf")
-        beta = float("inf")
+        best_move = None
+        best_val = -float("inf")
 
-        for (x, y) in moves:
+        for move in moves:
+            x, y = move
             self.make_move(x, y)
-            val = -self._negamax(max_depth - 1, -beta, -alpha, deadline)
+            val, _ = self._negamax(max_depth - 1, -beta, -alpha, deadline)
+            val = -val
             self.undo_move(x, y)
 
             if self._time_up:
@@ -300,10 +413,12 @@ class CommandInterface:
 
             if val > best_val or best_move is None:
                 best_val = val
-                best_move = (x, y)
+                best_move = move
 
             if val > alpha:
                 alpha = val
+            if alpha >= beta:
+                break
 
         return best_move, best_val
     
@@ -318,20 +433,20 @@ class CommandInterface:
         return moves
 
     def make_move(self, x, y):
+        self.current_hash ^= self.zobrist_player[self.to_play - 1]
         self.board[y][x] = self.to_play
+        self.current_hash ^= self.zobrist_table[(x, y, self.to_play)]
         self.move_count += 1
-        if self.to_play == 1:
-            self.to_play = 2
-        else:
-            self.to_play = 1
+        self.to_play = 3 - self.to_play
+        self.current_hash ^= self.zobrist_player[self.to_play - 1]
 
     def undo_move(self, x, y):
+        self.current_hash ^= self.zobrist_player[self.to_play - 1]
+        self.to_play = 3 - self.to_play
+        self.current_hash ^= self.zobrist_player[self.to_play - 1]
+        self.current_hash ^= self.zobrist_table[(x, y, self.to_play)]
         self.board[y][x] = 0
         self.move_count -= 1
-        if self.to_play == 1:
-            self.to_play = 2
-        else:
-            self.to_play = 1
 
     # Returns p1_score, p2_score
     def calculate_score(self):
@@ -430,28 +545,49 @@ class CommandInterface:
             return True
 
         start = time.perf_counter()
-        effective_limit = max(0.001, float(self.time_limit))
-        deadline = start + max(0.01, 0.9 * effective_limit)
+        deadline = start + self.time_limit * 0.85
 
-        moves.sort(key=self._move_order_key, reverse=True)
-        best_move = moves[0]
+        self.killer_moves = {}
+        
+        # fallback - pick center-ish move
+        cx, cy = self.width // 2, self.height // 2
+        best_move = min(moves, key=lambda m: abs(m[0] - cx) + abs(m[1] - cy))
         best_val = -float("inf")
 
         self._pv_move = None
-
         depth = 1
+        
         while True:
             self._time_up = False
-            move, val = self._root_search(depth, deadline)
-
-            if not self._time_up and move is not None:
-                best_move, best_val = move, val
-                self._pv_move = move
-                depth += 1
-
-                if depth > self.width * self.height:
-                    break
+            
+            # aspiration window for depth > 2
+            if depth > 2 and best_val != -float("inf"):
+                window = 60
+                alpha = best_val - window
+                beta = best_val + window
+                move, val = self._root_search(depth, deadline, alpha, beta)
+                
+                # re-search if outside window
+                if not self._time_up and (val <= alpha or val >= beta):
+                    move, val = self._root_search(depth, deadline, -float("inf"), float("inf"))
             else:
+                move, val = self._root_search(depth, deadline, -float("inf"), float("inf"))
+
+            if self._time_up:
+                break
+
+            if move is not None:
+                best_move = move
+                best_val = val
+                self._pv_move = move
+
+            depth += 1
+            
+            elapsed = time.perf_counter() - start
+            if elapsed > self.time_limit * 0.7:
+                break
+            
+            if depth > self.width * self.height:
                 break
 
         x, y = best_move
