@@ -12,10 +12,12 @@ class MCTSNode:
         self.parent = parent
         self.move = move
         self.player = player
-        self.children = []
+        self.children = {}
         self.untried_moves = None
         self.visits = 0
         self.value = 0.0
+        self.rave_visits = 0
+        self.rave_value = 0.0
 
 class CommandInterface:
     # The following is already defined and does not need modification
@@ -50,6 +52,8 @@ class CommandInterface:
         self.killer_moves = {}
         self.history = {}
         self._max_depth = 1
+        
+        self._mcts_root = None
 
     # Convert a raw string to a command and a list of arguments
     def process_command(self, s):
@@ -160,6 +164,7 @@ class CommandInterface:
         self._tt = {}
         self.killer_moves = {}
         self.history = {}
+        self._mcts_root = None
         
         self.init_zobrist()
         return True
@@ -198,6 +203,7 @@ class CommandInterface:
         
         # put the piece onto the board
         self.make_move(x, y)
+        self._advance_mcts_root((x, y))
 
         return True
 
@@ -331,81 +337,104 @@ class CommandInterface:
         ordered.extend([m for _, m in scored])
         return ordered
 
-    # ==================== MCTS ====================
+    # ==================== MCTS with RAVE ====================
     
+    def _advance_mcts_root(self, move):
+        if self._mcts_root is None:
+            return
+        if move in self._mcts_root.children:
+            self._mcts_root = self._mcts_root.children[move]
+            self._mcts_root.parent = None
+        else:
+            self._mcts_root = None
+
     def _mcts_select_move(self, deadline):
         root_player = self.to_play
-        root = MCTSNode(parent=None, move=None, player=3 - self.to_play)
-        root.untried_moves = list(self.get_moves())
+        
+        if self._mcts_root is None:
+            root = MCTSNode(parent=None, move=None, player=3 - self.to_play)
+            root.untried_moves = list(self.get_moves())
+        else:
+            root = self._mcts_root
+            if root.untried_moves is None:
+                root.untried_moves = list(self.get_moves())
         
         simulations = 0
         
-        while time.perf_counter() < deadline:
+        while time.perf_counter() < deadline - 0.01:
             node = root
             move_stack = []
+            amaf = {1: set(), 2: set()}
             
             # selection
             while node.untried_moves is not None and len(node.untried_moves) == 0:
                 if not node.children:
                     break
-                node = self._uct_select(node)
+                node = self._uct_rave_select(node)
                 self.make_move(*node.move)
                 move_stack.append(node.move)
+                amaf[node.player].add(node.move)
             
             # expansion
             if node.untried_moves is None:
                 node.untried_moves = list(self.get_moves())
             
             if node.untried_moves:
-                # pick move with simple heuristic
                 move = self._pick_expansion_move(node.untried_moves)
                 node.untried_moves.remove(move)
                 self.make_move(*move)
                 move_stack.append(move)
                 
                 child = MCTSNode(parent=node, move=move, player=self.to_play)
-                node.children.append(child)
+                node.children[move] = child
                 node = child
+                amaf[node.player].add(move)
             
-            # simulation
-            value = self._mcts_rollout(root_player)
+            # simulation (full rollout)
+            value = self._mcts_rollout(root_player, amaf)
             
             # undo moves
             while move_stack:
                 self.undo_move(*move_stack.pop())
             
-            # backprop
-            while node:
-                node.visits += 1
-                node.value += value
-                node = node.parent
+            # backprop with RAVE
+            self._backprop_rave(node, value, amaf, root_player)
             
             simulations += 1
+        
+        self._mcts_root = root
         
         if not root.children:
             moves = self.get_moves()
             return moves[0] if moves else None
         
-        best = max(root.children, key=lambda c: c.visits)
+        best = max(root.children.values(), key=lambda c: c.visits)
         return best.move
 
-    def _uct_select(self, node):
-        C = 1.4
+    def _uct_rave_select(self, node):
+        C = 0.5
+        RAVE_K = 300.0
+        
         log_n = math.log(node.visits + 1)
-        
         best = None
-        best_ucb = -float("inf")
+        best_score = -float("inf")
         
-        for child in node.children:
+        for child in node.children.values():
             if child.visits == 0:
                 return child
             
-            exploit = child.value / child.visits
-            explore = C * math.sqrt(log_n / child.visits)
-            ucb = exploit + explore
+            q = child.value / child.visits
             
-            if ucb > best_ucb:
-                best_ucb = ucb
+            if child.rave_visits > 0:
+                rave_q = child.rave_value / child.rave_visits
+                beta = math.sqrt(RAVE_K / (3.0 * node.visits + RAVE_K))
+                q = beta * rave_q + (1.0 - beta) * q
+            
+            u = C * math.sqrt(log_n / child.visits)
+            score = q + u
+            
+            if score > best_score:
+                best_score = score
                 best = child
         
         return best
@@ -428,64 +457,91 @@ class CommandInterface:
             scored.append((s, move))
         
         scored.sort(reverse=True, key=lambda p: p[0])
-        # pick from top 3 randomly
         top = [m for _, m in scored[:3]]
         return random.choice(top)
 
-    def _mcts_rollout(self, root_player):
+    def _mcts_rollout(self, root_player, amaf):
         rollout_moves = []
-        max_depth = 25
         
-        while len(rollout_moves) < max_depth and not self._board_full():
+        while not self._board_full():
             moves = self.get_moves()
             if not moves:
                 break
             
             move = self._rollout_policy(moves)
             self.make_move(*move)
-            rollout_moves.append(move)
+            rollout_moves.append((move, self.to_play))
+            amaf[3 - self.to_play].add(move)
         
-        # evaluate
         p1_score, p2_score = self.calculate_score()
         diff = p1_score - p2_score
         
-        # from root player perspective
         if root_player == 2:
             diff = -diff
         
-        # undo
         while rollout_moves:
-            self.undo_move(*rollout_moves.pop())
+            move, _ = rollout_moves.pop()
+            self.undo_move(*move)
         
-        return max(-1.0, min(1.0, diff / 100.0))
+        return max(-1.0, min(1.0, diff / 120.0))
 
     def _rollout_policy(self, moves):
-        if len(moves) <= 5:
-            return random.choice(moves)
-        
-        # score a sample of moves
-        sample = random.sample(moves, min(8, len(moves)))
+        sample_size = min(6, len(moves))
+        if sample_size == len(moves):
+            sample = moves
+        else:
+            sample = random.sample(moves, sample_size)
         
         best_move = sample[0]
-        best_score = -999
+        best_score = -9999
         cx, cy = self.width // 2, self.height // 2
         
         for move in sample:
             x, y = move
             s = 0
             s -= abs(x - cx) + abs(y - cy)
-            s += self._count_adjacent(x, y) * 3
+            
+            adj = 0
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < self.width and 0 <= ny < self.height:
+                        if self.board[ny][nx] != 0:
+                            adj += 1
+            s += adj * 4
             
             for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
                 my_len = self._line_potential(x, y, dx, dy, self.to_play)
                 if my_len >= 2:
-                    s += my_len * my_len
+                    s += my_len * my_len * 2
             
             if s > best_score:
                 best_score = s
                 best_move = move
         
         return best_move
+
+    def _backprop_rave(self, leaf, value, amaf, root_player):
+        node = leaf
+        while node is not None:
+            node.visits += 1
+            if node.player == root_player:
+                node.value += value
+            else:
+                node.value -= value
+            
+            if node.parent is not None:
+                for sib_move, sib in node.parent.children.items():
+                    if sib_move in amaf.get(sib.player, set()):
+                        sib.rave_visits += 1
+                        if sib.player == root_player:
+                            sib.rave_value += value
+                        else:
+                            sib.rave_value -= value
+            
+            node = node.parent
 
     # ==================== ALPHA-BETA ====================
 
@@ -767,12 +823,10 @@ class CommandInterface:
         
         empties = self._get_empties()
         
-        # hybrid strategy based on game phase
-        if empties >= 38:
-            # opening: use MCTS
+        # hybrid: MCTS for opening/midgame, AB for endgame
+        if empties >= 18:
             move = self._mcts_select_move(deadline)
         else:
-            # mid/end game: use alpha-beta
             move = self._ab_select_move(deadline)
 
         if move is None:
@@ -781,6 +835,7 @@ class CommandInterface:
 
         x, y = move
         self.make_move(x, y)
+        self._advance_mcts_root((x, y))
         print(x, y)
         return True
 
