@@ -350,7 +350,7 @@ class CommandInterface:
         root_player = self.to_play
         
         if self._mcts_root is None:
-            root = MCTSNode(parent=None, move=None, player=None)
+            root = MCTSNode(parent=None, move=None, player=3 - self.to_play)
             root.untried_moves = list(self.get_moves())
         else:
             root = self._mcts_root
@@ -522,7 +522,7 @@ class CommandInterface:
             
             if node.parent is not None:
                 for sib_move, sib in node.parent.children.items():
-                    if sib_move in amaf.get(sib.player, set()):
+                    if sib.player is not None and sib_move in amaf.get(sib.player, set()):
                         sib.rave_visits += 1
                         sib.rave_value += value
             
@@ -806,7 +806,7 @@ class CommandInterface:
         
         empties = self._get_empties()
         
-        if empties >= 18:
+        if empties >= 40:
             move = self._mcts_select_move(deadline)
         else:
             move = self._ab_select_move(deadline)
