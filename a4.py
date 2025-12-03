@@ -351,7 +351,12 @@ class CommandInterface:
         
         if self._mcts_root is None:
             root = MCTSNode(parent=None, move=None, player=3 - self.to_play)
-            root.untried_moves = list(self.get_moves())
+            moves = []
+            for y in range(self.height):
+                for x in range(self.width):
+                    if self.board[y][x] == 0:
+                        moves.append((x, y))
+            root.untried_moves = moves
         else:
             root = self._mcts_root
             if root.untried_moves is None:
@@ -359,39 +364,42 @@ class CommandInterface:
         
         while time.perf_counter() < deadline - 0.01:
             node = root
-            move_stack = []
-            amaf = {1: set(), 2: set()}
+            sim_board = [row[:] for row in self.board]
             
             while node.untried_moves is not None and len(node.untried_moves) == 0:
                 if not node.children:
                     break
                 node = self._uct_rave_select(node)
-                player_moved = node.player
-                self.make_move(*node.move)
-                move_stack.append(node.move)
-                amaf[player_moved].add(node.move)
+                sim_board[node.move[1]][node.move[0]] = node.player
             
             if node.untried_moves is None:
-                node.untried_moves = list(self.get_moves())
+                moves = []
+                for y in range(self.height):
+                    for x in range(self.width):
+                        if sim_board[y][x] == 0:
+                            moves.append((x, y))
+                node.untried_moves = moves
             
             if node.untried_moves:
-                move = self._pick_expansion_move(node.untried_moves)
+                move = random.choice(node.untried_moves)
                 node.untried_moves.remove(move)
-                player_moved = self.to_play
-                self.make_move(*move)
-                move_stack.append(move)
                 
-                child = MCTSNode(parent=node, move=move, player=player_moved)
+                next_player = 3 - node.player
+                child = MCTSNode(parent=node, move=move, player=next_player)
+                sim_board[move[1]][move[0]] = child.player
                 node.children[move] = child
                 node = child
-                amaf[player_moved].add(move)
             
-            value = self._mcts_rollout(root_player, amaf)
+            amaf = {1: set(), 2: set()}
+            curr = node
+            while curr.parent:
+                amaf[curr.player].add(curr.move)
+                curr = curr.parent
             
-            while move_stack:
-                self.undo_move(*move_stack.pop())
+            score_diff = self._simulate_heuristic(sim_board, 3 - node.player, amaf)
+            norm_score = max(-1.0, min(1.0, score_diff / 100.0))
             
-            self._backprop_rave(node, value, amaf)
+            self._backprop_rave(node, norm_score, amaf)
         
         self._mcts_root = root
         
@@ -403,10 +411,14 @@ class CommandInterface:
         return best.move
 
     def _uct_rave_select(self, node):
-        C = 0.5
+        C = 0.4
         RAVE_K = 300.0
         
-        log_n = math.log(node.visits + 1)
+        if node.visits == 0:
+            log_n = 0
+        else:
+            log_n = math.log(node.visits)
+        
         best = None
         best_score = -float("inf")
         
@@ -414,15 +426,17 @@ class CommandInterface:
             if child.visits == 0:
                 return child
             
-            q = child.value / child.visits
+            win_rate = child.value / child.visits
+            explore = C * math.sqrt(log_n / child.visits)
             
-            if child.rave_visits > 0:
-                rave_q = child.rave_value / child.rave_visits
+            if child.rave_visits > 5:
                 beta = math.sqrt(RAVE_K / (3.0 * node.visits + RAVE_K))
-                q = beta * rave_q + (1.0 - beta) * q
+                rave_rate = child.rave_value / child.rave_visits
+                combined = (1.0 - beta) * win_rate + beta * rave_rate
+            else:
+                combined = win_rate
             
-            u = C * math.sqrt(log_n / child.visits)
-            score = q + u
+            score = combined + explore
             
             if score > best_score:
                 best_score = score
@@ -430,101 +444,125 @@ class CommandInterface:
         
         return best
 
-    def _pick_expansion_move(self, moves):
-        if len(moves) <= 3:
-            return moves[0]
-        
-        scored = []
-        cx, cy = self.width // 2, self.height // 2
-        for move in moves:
-            x, y = move
-            s = 0
-            s += self._count_adjacent(x, y) * 10
-            s -= abs(x - cx) + abs(y - cy)
-            for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
-                my_len = self._line_potential(x, y, dx, dy, self.to_play)
-                if my_len >= 2:
-                    s += my_len * my_len
-            scored.append((s, move))
-        
-        scored.sort(reverse=True, key=lambda p: p[0])
-        top = [m for _, m in scored[:3]]
-        return random.choice(top)
 
-    def _mcts_rollout(self, root_player, amaf):
-        rollout_moves = []
+    def _simulate_heuristic(self, board, turn, amaf_moves):
+        empty = []
+        for y in range(self.height):
+            for x in range(self.width):
+                if board[y][x] == 0:
+                    empty.append((x, y))
         
-        while not self._board_full():
-            moves = self.get_moves()
-            if not moves:
-                break
+        random.shuffle(empty)
+        
+        while empty:
+            candidates = empty[-4:]
+            best_move = None
+            best_score = -999
             
-            move = self._rollout_policy(moves)
-            player_moved = self.to_play
-            self.make_move(*move)
-            rollout_moves.append(move)
-            amaf[player_moved].add(move)
-        
-        p1_score, p2_score = self.calculate_score()
-        diff = p1_score - p2_score
-        
-        if root_player == 2:
-            diff = -diff
-        
-        while rollout_moves:
-            self.undo_move(*rollout_moves.pop())
-        
-        return max(-1.0, min(1.0, diff / 120.0))
-
-    def _rollout_policy(self, moves):
-        sample_size = min(6, len(moves))
-        if sample_size == len(moves):
-            sample = moves
-        else:
-            sample = random.sample(moves, sample_size)
-        
-        best_move = sample[0]
-        best_score = -9999
-        cx, cy = self.width // 2, self.height // 2
-        
-        for move in sample:
-            x, y = move
-            s = 0
-            s -= abs(x - cx) + abs(y - cy)
-            
-            adj = 0
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    if dx == 0 and dy == 0:
-                        continue
-                    nx, ny = x + dx, y + dy
+            for cx, cy in candidates:
+                score = 0
+                score -= abs(cx - self.width // 2) + abs(cy - self.height // 2)
+                
+                has_adj = False
+                for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    nx, ny = cx + dx, cy + dy
                     if 0 <= nx < self.width and 0 <= ny < self.height:
-                        if self.board[ny][nx] != 0:
-                            adj += 1
-            s += adj * 4
+                        if board[ny][nx] != 0:
+                            has_adj = True
+                            break
+                if has_adj:
+                    score += 2
+                
+                if score > best_score:
+                    best_score = score
+                    best_move = (cx, cy)
             
-            for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
-                my_len = self._line_potential(x, y, dx, dy, self.to_play)
-                if my_len >= 2:
-                    s += my_len * my_len * 2
+            move = best_move
+            empty.remove(move)
             
-            if s > best_score:
-                best_score = s
-                best_move = move
+            board[move[1]][move[0]] = turn
+            amaf_moves[turn].add(move)
+            turn = 3 - turn
         
-        return best_move
+        p1_score, p2_score = self._calculate_score_from_board(board)
+        return p1_score - p2_score
+    
+    def _calculate_score_from_board(self, board):
+        p1_score = 0
+        p2_score = self.handicap
+        
+        for y in range(self.height):
+            for x in range(self.width):
+                c = board[y][x]
+                if c != 0:
+                    lone_piece = True
+                    hl = 1
+                    if x == 0 or board[y][x-1] != c:
+                        x1 = x + 1
+                        while x1 < self.width and board[y][x1] == c:
+                            hl += 1
+                            x1 += 1
+                    else:
+                        lone_piece = False
+                    vl = 1
+                    if y == 0 or board[y-1][x] != c:
+                        y1 = y + 1
+                        while y1 < self.height and board[y1][x] == c:
+                            vl += 1
+                            y1 += 1
+                    else:
+                        lone_piece = False
+                    dl = 1
+                    if y == 0 or x == 0 or board[y-1][x-1] != c:
+                        x1 = x + 1
+                        y1 = y + 1
+                        while x1 < self.width and y1 < self.height and board[y1][x1] == c:
+                            dl += 1
+                            x1 += 1
+                            y1 += 1
+                    else:
+                        lone_piece = False
+                    al = 1
+                    if y == 0 or x == self.width - 1 or board[y-1][x+1] != c:
+                        x1 = x - 1
+                        y1 = y + 1
+                        while x1 >= 0 and y1 < self.height and board[y1][x1] == c:
+                            al += 1
+                            x1 -= 1
+                            y1 += 1
+                    else:
+                        lone_piece = False
+                    for line_length in [hl, vl, dl, al]:
+                        if line_length > 1:
+                            if c == 1:
+                                p1_score += 2 ** (line_length - 1)
+                            else:
+                                p2_score += 2 ** (line_length - 1)
+                    if hl == vl == dl == al == 1 and lone_piece:
+                        if c == 1:
+                            p1_score += 1
+                        else:
+                            p2_score += 1
+        return p1_score, p2_score
 
-    def _backprop_rave(self, leaf, value, amaf):
+    def _backprop_rave(self, leaf, norm_score, amaf):
         node = leaf
         while node is not None:
             node.visits += 1
-            node.value += value
+            
+            if node.player == 1:
+                node.value += norm_score
+            elif node.player == 2:
+                node.value -= norm_score
             
             if node.parent is not None:
-                for sib_move, sib in node.parent.children.items():
-                    if sib.player is not None and sib_move in amaf.get(sib.player, set()):
+                for sib in node.parent.children.values():
+                    if sib.move in amaf.get(sib.player, set()):
                         sib.rave_visits += 1
-                        sib.rave_value += value
+                        if sib.player == 1:
+                            sib.rave_value += norm_score
+                        else:
+                            sib.rave_value -= norm_score
             
             node = node.parent
 
