@@ -5,6 +5,17 @@
 import sys
 import time
 import random
+import math
+
+class MCTSNode:
+    def __init__(self, parent=None, move=None, player=None):
+        self.parent = parent
+        self.move = move
+        self.player = player
+        self.children = []
+        self.untried_moves = None
+        self.visits = 0
+        self.value = 0.0
 
 class CommandInterface:
     # The following is already defined and does not need modification
@@ -30,16 +41,15 @@ class CommandInterface:
         self._time_up = False
         self.move_count = 0
         
-        # zobrist hashing
         self.zobrist_table = None
         self.zobrist_player = None
         self.current_hash = 0
         
-        # transposition table and search state
         self._tt = {}
         self._pv_move = None
         self.killer_moves = {}
         self.history = {}
+        self._max_depth = 1
 
     # Convert a raw string to a command and a list of arguments
     def process_command(self, s):
@@ -212,17 +222,11 @@ class CommandInterface:
         return length
 
     def _line_potential(self, x, y, dx, dy, player):
-        fwd = self._count_line(x, y, dx, dy, player)
-        bwd = self._count_line(x, y, -dx, -dy, player)
-        return fwd + bwd
+        return self._count_line(x, y, dx, dy, player) + self._count_line(x, y, -dx, -dy, player)
 
-    def _evaluate(self):
-        p1_score, p2_score = self.calculate_score()
-        base = p1_score - p2_score if self.to_play == 1 else p2_score - p1_score
-        
-        # threat analysis - look at line extension potential
-        my_threat = 0
-        opp_threat = 0
+    def _calculate_threats(self):
+        my_threats = 0
+        opp_threats = 0
         opp = 3 - self.to_play
         
         for y in range(self.height):
@@ -232,12 +236,38 @@ class CommandInterface:
                 for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
                     my_len = self._line_potential(x, y, dx, dy, self.to_play)
                     if my_len >= 2:
-                        my_threat += my_len * my_len
+                        my_threats += my_len ** 2.5
                     opp_len = self._line_potential(x, y, dx, dy, opp)
                     if opp_len >= 2:
-                        opp_threat += opp_len * opp_len
+                        opp_threats += opp_len ** 2.5
         
-        return base + 0.12 * (my_threat - 0.9 * opp_threat)
+        return my_threats - 0.85 * opp_threats
+
+    def _evaluate_center(self):
+        cx, cy = self.width // 2, self.height // 2
+        my_center = 0
+        opp_center = 0
+        opp = 3 - self.to_play
+        
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < self.width and 0 <= ny < self.height:
+                    if self.board[ny][nx] == self.to_play:
+                        my_center += 1
+                    elif self.board[ny][nx] == opp:
+                        opp_center += 1
+        
+        return my_center - opp_center
+
+    def _evaluate(self):
+        p1_score, p2_score = self.calculate_score()
+        base = p1_score - p2_score if self.to_play == 1 else p2_score - p1_score
+        
+        threat = self._calculate_threats()
+        center = self._evaluate_center()
+        
+        return base + 0.15 * threat + 0.05 * center
 
     def _tactical_score(self, x, y):
         score = 0
@@ -245,10 +275,10 @@ class CommandInterface:
         for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
             my_len = self._line_potential(x, y, dx, dy, self.to_play)
             if my_len > 0:
-                score += my_len * my_len * 2
+                score += my_len ** 3
             opp_len = self._line_potential(x, y, dx, dy, opp)
-            if opp_len > 0:
-                score += opp_len * opp_len
+            if opp_len >= 2:
+                score += (opp_len ** 2.5) * 0.8
         return score
 
     def _count_adjacent(self, x, y):
@@ -270,19 +300,20 @@ class CommandInterface:
         ordered = []
         remaining = list(moves)
         
-        # TT best move first
         if tt_best and tt_best in remaining:
             ordered.append(tt_best)
             remaining.remove(tt_best)
         
-        # killer moves
+        if self._pv_move and self._pv_move in remaining:
+            ordered.append(self._pv_move)
+            remaining.remove(self._pv_move)
+        
         if depth in self.killer_moves:
             for killer in self.killer_moves[depth]:
                 if killer in remaining:
                     ordered.append(killer)
                     remaining.remove(killer)
         
-        # score the rest
         cx = self.width / 2.0
         cy = self.height / 2.0
         scored = []
@@ -290,8 +321,8 @@ class CommandInterface:
             x, y = move
             s = 0
             s += self.history.get(move, 0)
-            s += self._tactical_score(x, y) * 500
-            s += self._count_adjacent(x, y) * 200
+            s += self._tactical_score(x, y) * 10000
+            s += self._count_adjacent(x, y) * 500
             dist = abs(x - cx) + abs(y - cy)
             s += (10 - dist) * 50
             scored.append((s, move))
@@ -300,38 +331,187 @@ class CommandInterface:
         ordered.extend([m for _, m in scored])
         return ordered
 
+    # ==================== MCTS ====================
+    
+    def _mcts_select_move(self, deadline):
+        root_player = self.to_play
+        root = MCTSNode(parent=None, move=None, player=3 - self.to_play)
+        root.untried_moves = list(self.get_moves())
+        
+        simulations = 0
+        
+        while time.perf_counter() < deadline:
+            node = root
+            move_stack = []
+            
+            # selection
+            while node.untried_moves is not None and len(node.untried_moves) == 0:
+                if not node.children:
+                    break
+                node = self._uct_select(node)
+                self.make_move(*node.move)
+                move_stack.append(node.move)
+            
+            # expansion
+            if node.untried_moves is None:
+                node.untried_moves = list(self.get_moves())
+            
+            if node.untried_moves:
+                # pick move with simple heuristic
+                move = self._pick_expansion_move(node.untried_moves)
+                node.untried_moves.remove(move)
+                self.make_move(*move)
+                move_stack.append(move)
+                
+                child = MCTSNode(parent=node, move=move, player=self.to_play)
+                node.children.append(child)
+                node = child
+            
+            # simulation
+            value = self._mcts_rollout(root_player)
+            
+            # undo moves
+            while move_stack:
+                self.undo_move(*move_stack.pop())
+            
+            # backprop
+            while node:
+                node.visits += 1
+                node.value += value
+                node = node.parent
+            
+            simulations += 1
+        
+        if not root.children:
+            moves = self.get_moves()
+            return moves[0] if moves else None
+        
+        best = max(root.children, key=lambda c: c.visits)
+        return best.move
+
+    def _uct_select(self, node):
+        C = 1.4
+        log_n = math.log(node.visits + 1)
+        
+        best = None
+        best_ucb = -float("inf")
+        
+        for child in node.children:
+            if child.visits == 0:
+                return child
+            
+            exploit = child.value / child.visits
+            explore = C * math.sqrt(log_n / child.visits)
+            ucb = exploit + explore
+            
+            if ucb > best_ucb:
+                best_ucb = ucb
+                best = child
+        
+        return best
+
+    def _pick_expansion_move(self, moves):
+        if len(moves) <= 3:
+            return moves[0]
+        
+        scored = []
+        cx, cy = self.width // 2, self.height // 2
+        for move in moves:
+            x, y = move
+            s = 0
+            s += self._count_adjacent(x, y) * 10
+            s -= abs(x - cx) + abs(y - cy)
+            for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
+                my_len = self._line_potential(x, y, dx, dy, self.to_play)
+                if my_len >= 2:
+                    s += my_len * my_len
+            scored.append((s, move))
+        
+        scored.sort(reverse=True, key=lambda p: p[0])
+        # pick from top 3 randomly
+        top = [m for _, m in scored[:3]]
+        return random.choice(top)
+
+    def _mcts_rollout(self, root_player):
+        rollout_moves = []
+        max_depth = 25
+        
+        while len(rollout_moves) < max_depth and not self._board_full():
+            moves = self.get_moves()
+            if not moves:
+                break
+            
+            move = self._rollout_policy(moves)
+            self.make_move(*move)
+            rollout_moves.append(move)
+        
+        # evaluate
+        p1_score, p2_score = self.calculate_score()
+        diff = p1_score - p2_score
+        
+        # from root player perspective
+        if root_player == 2:
+            diff = -diff
+        
+        # undo
+        while rollout_moves:
+            self.undo_move(*rollout_moves.pop())
+        
+        return max(-1.0, min(1.0, diff / 100.0))
+
+    def _rollout_policy(self, moves):
+        if len(moves) <= 5:
+            return random.choice(moves)
+        
+        # score a sample of moves
+        sample = random.sample(moves, min(8, len(moves)))
+        
+        best_move = sample[0]
+        best_score = -999
+        cx, cy = self.width // 2, self.height // 2
+        
+        for move in sample:
+            x, y = move
+            s = 0
+            s -= abs(x - cx) + abs(y - cy)
+            s += self._count_adjacent(x, y) * 3
+            
+            for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
+                my_len = self._line_potential(x, y, dx, dy, self.to_play)
+                if my_len >= 2:
+                    s += my_len * my_len
+            
+            if s > best_score:
+                best_score = s
+                best_move = move
+        
+        return best_move
+
+    # ==================== ALPHA-BETA ====================
+
     def _negamax(self, depth, alpha, beta, deadline):
         if time.perf_counter() >= deadline:
             self._time_up = True
-            return self._evaluate(), None
+            return 0.0, None
 
         if self._board_full():
             return self._evaluate(), None
 
-        if depth == 0:
+        if depth >= self._max_depth:
             return self._evaluate(), None
 
-        empties = self._get_empties()
-        if empties <= 12:
-            effective_depth = min(depth, empties)
-        else:
-            effective_depth = depth
-
-        alpha_orig = alpha
         hash_key = self.current_hash
         tt_best = None
         
         if hash_key in self._tt:
             tt_depth, tt_val, tt_flag, tt_move = self._tt[hash_key]
             tt_best = tt_move
-            if tt_depth >= effective_depth:
+            if tt_depth >= self._max_depth - depth:
                 if tt_flag == 'exact':
                     return tt_val, tt_move
-                elif tt_flag == 'lower':
-                    alpha = max(alpha, tt_val)
-                elif tt_flag == 'upper':
-                    beta = min(beta, tt_val)
-                if alpha >= beta:
+                elif tt_flag == 'lower' and tt_val >= beta:
+                    return tt_val, tt_move
+                elif tt_flag == 'upper' and tt_val <= alpha:
                     return tt_val, tt_move
 
         moves = self.get_moves()
@@ -342,11 +522,12 @@ class CommandInterface:
 
         best = -float("inf")
         best_move = None
+        alpha_orig = alpha
 
         for move in moves:
             x, y = move
             self.make_move(x, y)
-            val, _ = self._negamax(effective_depth - 1, -beta, -alpha, deadline)
+            val, _ = self._negamax(depth + 1, -beta, -alpha, deadline)
             val = -val
             self.undo_move(x, y)
 
@@ -359,15 +540,13 @@ class CommandInterface:
             if val > alpha:
                 alpha = val
             if alpha >= beta:
-                # update killer moves
                 if depth not in self.killer_moves:
                     self.killer_moves[depth] = []
                 if move not in self.killer_moves[depth]:
                     self.killer_moves[depth].insert(0, move)
                     if len(self.killer_moves[depth]) > 2:
                         self.killer_moves[depth].pop()
-                # history heuristic
-                bonus = depth * depth
+                bonus = (self._max_depth - depth) ** 2
                 self.history[move] = self.history.get(move, 0) + bonus
                 break
 
@@ -378,20 +557,59 @@ class CommandInterface:
                 tt_flag = 'lower'
             else:
                 tt_flag = 'exact'
-            self._tt[hash_key] = (effective_depth, best, tt_flag, best_move)
+            self._tt[hash_key] = (self._max_depth - depth, best, tt_flag, best_move)
 
         return best, best_move
 
-    def _root_search(self, max_depth, deadline, alpha, beta):
+    def _ab_select_move(self, deadline):
+        self.killer_moves = {}
+        
         moves = self.get_moves()
         if not moves:
-            return None, 0.0
+            return None
+
+        moves = self._order_moves(moves, 0, None)
+        best_move = moves[0]
+        best_val = -float("inf")
+
+        depth = 1
+        start = time.perf_counter()
+        
+        while True:
+            self._time_up = False
+            self._max_depth = depth
+
+            val, move = self._root_ab_search(depth, deadline)
+
+            if self._time_up:
+                break
+
+            if move is not None:
+                best_move = move
+                best_val = val
+                self._pv_move = move
+
+            depth += 1
+            
+            elapsed = time.perf_counter() - start
+            if elapsed > self.time_limit * 0.7:
+                break
+            
+            if depth > self._get_empties():
+                break
+
+        return best_move
+
+    def _root_ab_search(self, max_depth, deadline):
+        moves = self.get_moves()
+        if not moves:
+            return 0.0, None
 
         hash_key = self.current_hash
         tt_best = None
         if hash_key in self._tt:
             tt_best = self._tt[hash_key][3]
-        
+
         moves = self._order_moves(moves, 0, tt_best)
         
         if self._pv_move and self._pv_move in moves:
@@ -400,27 +618,27 @@ class CommandInterface:
 
         best_move = None
         best_val = -float("inf")
+        alpha = -float("inf")
+        beta = float("inf")
 
         for move in moves:
             x, y = move
             self.make_move(x, y)
-            val, _ = self._negamax(max_depth - 1, -beta, -alpha, deadline)
+            val, _ = self._negamax(1, -beta, -alpha, deadline)
             val = -val
             self.undo_move(x, y)
 
             if self._time_up:
                 break
 
-            if val > best_val or best_move is None:
+            if val > best_val:
                 best_val = val
                 best_move = move
 
             if val > alpha:
                 alpha = val
-            if alpha >= beta:
-                break
 
-        return best_move, best_val
+        return best_val, best_move
     
     # Optional helper functions that you may use or replace with your own.
 
@@ -546,51 +764,22 @@ class CommandInterface:
 
         start = time.perf_counter()
         deadline = start + self.time_limit * 0.85
-
-        self.killer_moves = {}
         
-        # fallback - pick center-ish move
-        cx, cy = self.width // 2, self.height // 2
-        best_move = min(moves, key=lambda m: abs(m[0] - cx) + abs(m[1] - cy))
-        best_val = -float("inf")
-
-        self._pv_move = None
-        depth = 1
+        empties = self._get_empties()
         
-        while True:
-            self._time_up = False
-            
-            # aspiration window for depth > 2
-            if depth > 2 and best_val != -float("inf"):
-                window = 60
-                alpha = best_val - window
-                beta = best_val + window
-                move, val = self._root_search(depth, deadline, alpha, beta)
-                
-                # re-search if outside window
-                if not self._time_up and (val <= alpha or val >= beta):
-                    move, val = self._root_search(depth, deadline, -float("inf"), float("inf"))
-            else:
-                move, val = self._root_search(depth, deadline, -float("inf"), float("inf"))
+        # hybrid strategy based on game phase
+        if empties >= 38:
+            # opening: use MCTS
+            move = self._mcts_select_move(deadline)
+        else:
+            # mid/end game: use alpha-beta
+            move = self._ab_select_move(deadline)
 
-            if self._time_up:
-                break
+        if move is None:
+            cx, cy = self.width // 2, self.height // 2
+            move = min(moves, key=lambda m: abs(m[0] - cx) + abs(m[1] - cy))
 
-            if move is not None:
-                best_move = move
-                best_val = val
-                self._pv_move = move
-
-            depth += 1
-            
-            elapsed = time.perf_counter() - start
-            if elapsed > self.time_limit * 0.7:
-                break
-            
-            if depth > self.width * self.height:
-                break
-
-        x, y = best_move
+        x, y = move
         self.make_move(x, y)
         print(x, y)
         return True
